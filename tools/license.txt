@@ -1,0 +1,41 @@
+﻿Recipe Lab Studio — 免费声明与使用许可 / 免費聲明與使用許可 / Free-of-charge Notice
+====================================================================================
+
+【简体中文】
+本软件永久免费，严禁以任何形式售卖、转卖或捆绑收费（包括：售卖本体或安装包；打包进收费商品、
+教程、会员服务或"整合包"；以"代安装""代下载""资源包"名义变相收费；删改本声明后再次分发）。
+若你是付费买到的，说明你被骗了 —— 请到官方发布页免费获取。
+本软件按"现状"提供，不附带任何明示或默示的担保；作者不对使用本软件造成的任何损失负责。
+提醒：向相机存储卡推送配方属于对存储介质的写操作，请在推送前自行备份卡内数据。
+
+版权所有人：jiajun zhou
+官方发布页：https://github.com/jjingith/recipe-lab-studio-sony-pmca
+
+--------------------------------------------------------------------------------
+
+【繁體中文】
+本軟體永久免費，嚴禁以任何形式販售、轉賣或綑綁收費（包括：販售本體或安裝包；打包進收費商品、
+教學、會員服務或「整合包」；以「代安裝」「代下載」「資源包」名義變相收費；刪改本聲明後再次散布）。
+若你是付費買到的，說明你被騙了 —— 請到官方發布頁免費取得。
+本軟體按「現狀」提供，不附帶任何明示或默示的擔保；作者不對使用本軟體造成的任何損失負責。
+提醒：向相機記憶卡推送配方屬於對儲存媒體的寫入操作，請在推送前自行備份卡內資料。
+
+版權所有人：jiajun zhou
+官方發布頁：https://github.com/jjingith/recipe-lab-studio-sony-pmca
+
+--------------------------------------------------------------------------------
+
+【English】
+FREE OF CHARGE. This software is permanently free. You may download, install, use, copy and
+redistribute it, for personal or commercial photography, at no cost and without asking permission.
+
+NOT FOR SALE. Charging any fee for it is strictly forbidden — selling the software or its installer;
+bundling it into a paid product, course, membership or "bundle"; charging a proxy fee for installing
+or downloading it; or removing this notice before redistributing it.
+If you paid for it, you were scammed; get it free from the official release page below.
+
+NO WARRANTY. Provided "as is", without warranty of any kind. The author is not liable for any damage.
+Note: pushing a recipe writes to the camera's memory card — back up the card first.
+
+Copyright holder: jiajun zhou
+Official release page: https://github.com/jjingith/recipe-lab-studio-sony-pmca

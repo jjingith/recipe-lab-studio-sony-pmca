@@ -1,0 +1,13 @@
+# ---- build artifacts, rebuilt by tools\build_exe.py and tools\package_release.py ----
+build/
+release/
+*.spec
+*.exe
+
+# ---- Python bytecode ----
+__pycache__/
+*.pyc
+
+# ---- your own data: recipes and settings are never committed to a public repo ----
+library/
+settings.json
