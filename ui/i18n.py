@@ -23,7 +23,7 @@ LANGUAGES = [LANG_HANS, LANG_HANT, LANG_EN]
 # ---- the release identity: the About box and the installer both read these from here -------------
 AUTHOR = "jiajun zhou"                                                   # the copyright holder
 GITHUB_URL = "https://github.com/jjingith/recipe-lab-studio-sony-pmca"   # the official release page
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 
 # the language names are shown in their own script in every UI language, so anyone can find theirs
 LANG_LABEL = {LANG_HANS: "简体中文", LANG_HANT: "繁體中文", LANG_EN: "English"}

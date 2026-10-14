@@ -18,11 +18,25 @@ def _icon():
     return os.path.join(base, "data", "icon.png")
 
 
+def _taskbar_identity():
+    """Give the process its own Windows task-bar identity (AppUserModelID). Without one the shell
+    falls back to the host interpreter's identity, so a window started through python.exe keeps
+    showing python's own icon in the task bar; an explicit id makes the shell use this app's."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("jjingith.RecipeLabStudio")
+    except Exception:
+        pass
+
+
 def main():
     from PySide6 import QtCore, QtGui, QtWidgets
     from ui.i18n import init_language
     from ui.main_window import MainWindow
 
+    _taskbar_identity()
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("Recipe Lab Studio")
     if os.path.exists(_icon()):
