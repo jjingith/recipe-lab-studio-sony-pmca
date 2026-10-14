@@ -54,25 +54,32 @@ def dropped_images(event):
     return out
 
 
-def clip_overlay(rgb, shadow_on=True, high_on=True):
-    """an RGBA overlay marking clipping the way Lightroom's triangles do: near-black pixels in blue,
-    near-white in red. Only the requested kinds are drawn; returns None when nothing is marked, so
-    the caller can skip the draw."""
-    if rgb is None or not (shadow_on or high_on):
-        return None
-    a = np.clip(np.asarray(rgb, float), 0.0, 1.0)
-    lum = 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
-    shadow = (lum < 0.02) if shadow_on else None
-    high = (lum > 0.98) if high_on else None
-    if not ((shadow is not None and shadow.any()) or (high is not None and high.any())):
-        return None
-    h, w = lum.shape
-    buf = np.zeros((h, w, 4), np.uint8)
-    if shadow is not None:
-        buf[shadow] = (40, 130, 255, 150)
-    if high is not None:
-        buf[high] = (255, 60, 40, 150)
-    return QtGui.QImage(buf.tobytes(), w, h, 4 * w, QtGui.QImage.Format_RGBA8888).copy()
+def bulb_icon(on):
+    """a minimal flat light-bulb for the theme switch — grey when the current theme is night, yellow
+    when it is day. Painted at 18 and 32 px so it stays crisp on HiDPI, with no gradients or glow."""
+    icon = QtGui.QIcon()
+    glass = QtGui.QColor("#f2c21f" if on else "#8c8c8c")
+    base = QtGui.QColor("#c9c9c9" if on else "#6f6f6f")
+    for s in (18, 32):
+        pm = QtGui.QPixmap(s, s)
+        pm.fill(QtCore.Qt.transparent)
+        p = QtGui.QPainter(pm)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        cx, cy, r = s * 0.5, s * 0.36, s * 0.31
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(glass)
+        p.drawEllipse(QtCore.QPointF(cx, cy), r, r)
+        bw, bh = s * 0.34, s * 0.24            # the screw base, tucked under the glass
+        by = cy + r * 0.68
+        p.setBrush(base)
+        p.drawRoundedRect(QtCore.QRectF(cx - bw / 2.0, by, bw, bh), s * 0.05, s * 0.05)
+        p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 90), max(1.0, s * 0.05)))
+        for f in (0.34, 0.64):
+            y = by + bh * f
+            p.drawLine(QtCore.QPointF(cx - bw * 0.36, y), QtCore.QPointF(cx + bw * 0.36, y))
+        p.end()
+        icon.addPixmap(pm)
+    return icon
 
 
 class ViewState(QtCore.QObject):
@@ -152,14 +159,13 @@ class ViewState(QtCore.QObject):
 
 class ImageView(QtWidgets.QWidget):
     """the preview plate: an RGB array on a canvas, zoomed by the wheel and panned by dragging.
-    Also takes a dropped image file, and can tint clipped pixels for the LR-style warnings."""
+    Also takes a dropped image file."""
 
     dropped = QtCore.Signal(list)
 
     def __init__(self, placeholder="NO IMAGE", state=None):
         super().__init__()
         self._img = None
-        self._rgb = None
         self._ph = placeholder
         self.state = state or ViewState()
         if state is not None:
@@ -168,27 +174,11 @@ class ImageView(QtWidgets.QWidget):
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
         self._drag = None
-        self._clip_shadow = False
-        self._clip_high = False
-        self._overlay = None
         self._drop_hot = False
 
     def set_image(self, rgb):
-        """keep the array as well as the QImage — the clipping overlay is computed from the array"""
-        self._rgb = rgb
         self._img = None if rgb is None else ndarray_to_qimage(rgb)
-        self._rebuild_overlay()
         self.update()
-
-    def set_clip_flags(self, shadow_on, high_on):
-        if (bool(shadow_on), bool(high_on)) == (self._clip_shadow, self._clip_high):
-            return
-        self._clip_shadow, self._clip_high = bool(shadow_on), bool(high_on)
-        self._rebuild_overlay()
-        self.update()
-
-    def _rebuild_overlay(self):
-        self._overlay = clip_overlay(self._rgb, self._clip_shadow, self._clip_high)
 
     # ------------------------------------------------------------ geometry
     def fitted_size(self):
@@ -274,8 +264,6 @@ class ImageView(QtWidgets.QWidget):
         else:
             p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self.state.zoom < 2.5)
             p.drawImage(self._draw_rect(), self._img)
-            if self._overlay is not None:
-                p.drawImage(self._draw_rect(), self._overlay)
         if self._drop_hot:
             p.setPen(QtGui.QPen(QtGui.QColor(COLORS["accent"]), 2, QtCore.Qt.DashLine))
             p.setBrush(QtCore.Qt.NoBrush)
@@ -295,10 +283,6 @@ class SplitView(QtWidgets.QWidget):
         super().__init__()
         self._src = None
         self._out = None
-        self._src_rgb = None
-        self._out_rgb = None
-        self._overlay_src = None
-        self._overlay_out = None
         self._ph = placeholder
         self.state = state
         state.attach(self)
@@ -309,31 +293,16 @@ class SplitView(QtWidgets.QWidget):
         self.setAcceptDrops(True)
         self._drag = None
         self._hot = False
-        self._clip_shadow = False
-        self._clip_high = False
         self._drop_hot = False
 
     def set_images(self, src_rgb, out_rgb):
-        self._src_rgb, self._out_rgb = src_rgb, out_rgb
         self._src = None if src_rgb is None else ndarray_to_qimage(src_rgb)
         self._out = None if out_rgb is None else ndarray_to_qimage(out_rgb)
-        self._rebuild_overlays()
         self.update()
 
     def set_orientation(self, vertical):
         self.vertical = bool(vertical)
         self.update()
-
-    def set_clip_flags(self, shadow_on, high_on):
-        if (bool(shadow_on), bool(high_on)) == (self._clip_shadow, self._clip_high):
-            return
-        self._clip_shadow, self._clip_high = bool(shadow_on), bool(high_on)
-        self._rebuild_overlays()
-        self.update()
-
-    def _rebuild_overlays(self):
-        self._overlay_src = clip_overlay(self._src_rgb, self._clip_shadow, self._clip_high)
-        self._overlay_out = clip_overlay(self._out_rgb, self._clip_shadow, self._clip_high)
 
     @property
     def comparable(self):
@@ -373,6 +342,14 @@ class SplitView(QtWidgets.QWidget):
 
     def _split_cursor(self):
         return QtCore.Qt.SplitHCursor if self.vertical else QtCore.Qt.SplitVCursor
+
+    def _draw_caption(self, p, rect, text, align):
+        """one before/after caption on its translucent pill, so it stays readable over any image"""
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(0, 0, 0, 120))
+        p.drawRoundedRect(rect, 3.0, 3.0)
+        p.setPen(QtGui.QColor(COLORS["cap_text"]))
+        p.drawText(rect, align, text)
 
     # ------------------------------------------------------------ drag & drop
     def dragEnterEvent(self, e):
@@ -464,14 +441,10 @@ class SplitView(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self.state.zoom < 2.5)
         if self._out is not None:
             p.drawImage(rect, self._out)
-            if self._overlay_out is not None:
-                p.drawImage(rect, self._overlay_out)
         if self._src is None:
             return
         if not self.comparable:
             p.drawImage(rect, self._src)
-            if self._overlay_src is not None:
-                p.drawImage(rect, self._overlay_src)
             return
         pos = self._line_pos()
         # the original, clipped to its side of the divider — left when vertical, above when horizontal
@@ -486,8 +459,6 @@ class SplitView(QtWidgets.QWidget):
         p.save()
         p.setClipRect(clip)
         p.drawImage(rect, self._src)
-        if self._overlay_src is not None:
-            p.drawImage(rect, self._overlay_src)
         p.restore()
         # the divider and its handle
         p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 130), 1))
@@ -507,11 +478,29 @@ class SplitView(QtWidgets.QWidget):
                 p.drawLine(QtCore.QPointF(pos - 3.0, cy + d), QtCore.QPointF(pos + 3.0, cy + d))
             else:
                 p.drawLine(QtCore.QPointF(cx + d, pos - 3.0), QtCore.QPointF(cx + d, pos + 3.0))
-        # which half is which
-        cap = QtCore.QRectF(r.left() + 7.0, r.top() + 5.0, w - 14.0, 18.0)
-        p.setPen(QtGui.QColor(COLORS["cap_text"]))
-        p.drawText(cap, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, t("label_src"))
-        p.drawText(cap, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, t("label_result"))
+        # which half is which — the captions ride both sides of the divider, like a Lightroom wipe
+        fm = QtGui.QFontMetricsF(p.font())
+        gap, padx, cap_h = 9.0, 5.0, 16.0
+        l_m, r_m = r.left() + 3.0, r.right() - 3.0
+        t_m, b_m = r.top() + 3.0, r.bottom() - 3.0
+        w_src = fm.horizontalAdvance(t("label_src")) + 2.0 * padx
+        w_res = fm.horizontalAdvance(t("label_result")) + 2.0 * padx
+        if self.vertical:
+            sx2 = max(l_m + w_src, min(pos - gap, r_m))
+            srect = QtCore.QRectF(sx2 - w_src, t_m, w_src, cap_h)
+            rx1 = min(r_m - w_res, max(pos + gap, l_m))
+            rrect = QtCore.QRectF(rx1, t_m, w_res, cap_h)
+            a_src = QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
+            a_res = QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter
+        else:
+            sy2 = max(t_m + cap_h, min(pos - gap, b_m))
+            srect = QtCore.QRectF(l_m, sy2 - cap_h, w_src, cap_h)
+            ry1 = min(b_m - cap_h, max(pos + gap, t_m))
+            rrect = QtCore.QRectF(l_m, ry1, w_res, cap_h)
+            a_src = QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter
+            a_res = QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter
+        self._draw_caption(p, srect, t("label_src"), a_src)
+        self._draw_caption(p, rrect, t("label_result"), a_res)
         if self._drop_hot:
             p.setPen(QtGui.QPen(QtGui.QColor(COLORS["accent"]), 2, QtCore.Qt.DashLine))
             p.setBrush(QtCore.Qt.NoBrush)
@@ -641,6 +630,13 @@ class ScoreStrip(QtWidgets.QWidget):
 
 
 # ------------------------------------------------------------ histogram
+# the plot keeps its own fixed dark plate in both themes: the RGB channels are drawn additively
+# (CompositionMode_Plus), so on the light theme's grey canvas they would wash out. A dark plate
+# makes the histogram look identical in night and day mode.
+PLOT_BG = "#181818"
+PLOT_LINE = "#e6e6e6"
+
+
 def _hist_bins(rgb):
     """256-bin R/G/B and luma histograms of an RGB array"""
     a = np.clip(np.asarray(rgb, float), 0.0, 1.0)
@@ -682,8 +678,10 @@ class _HistPlot(QtWidgets.QWidget):
         p = QtGui.QPainter(self)
         r = self.rect()
         w, h = float(r.width()), float(r.height())
-        p.fillRect(r, QtGui.QColor(COLORS["canvas"]))
-        p.setPen(QtGui.QPen(QtGui.QColor(COLORS["line"]), 1))
+        p.fillRect(r, QtGui.QColor(PLOT_BG))
+        grid = QtGui.QColor(PLOT_LINE)
+        grid.setAlpha(38)
+        p.setPen(QtGui.QPen(grid, 1))
         for f in (0.25, 0.5, 0.75):
             x = w * f
             p.drawLine(QtCore.QPointF(x, 0.0), QtCore.QPointF(x, h))
@@ -698,14 +696,14 @@ class _HistPlot(QtWidgets.QWidget):
             p.setBrush(c)
             p.drawPath(self._path(self._bins[key], peak, w, h))
         p.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
-        p.setPen(QtGui.QPen(QtGui.QColor(COLORS["text"]), 1))
+        p.setPen(QtGui.QPen(QtGui.QColor(PLOT_LINE), 1))
         p.setBrush(QtCore.Qt.NoBrush)
         p.drawPath(self._path(self._bins["l"], peak, w, h))
 
 
 class Histogram(QtWidgets.QWidget):
-    """Lightroom's histogram block: the RGB plot, a before/after switch, the clipping toggles and the
-    exposure metadata line underneath."""
+    """Lightroom's histogram block: the RGB plot, a before/after switch and the exposure metadata
+    line underneath."""
 
     mode_changed = QtCore.Signal(str)          # 'before' | 'after'
 
@@ -723,16 +721,6 @@ class Histogram(QtWidgets.QWidget):
         self.btn_mode.toggled.connect(self._on_mode)
         row.addWidget(self.btn_mode)
         row.addStretch(1)
-        self.btn_shadow = QtWidgets.QToolButton()
-        self.btn_shadow.setText(t("clip_shadow"))
-        self.btn_shadow.setCheckable(True)
-        self.btn_shadow.setToolTip(t("tip_clip_shadow"))
-        row.addWidget(self.btn_shadow)
-        self.btn_high = QtWidgets.QToolButton()
-        self.btn_high.setText(t("clip_high"))
-        self.btn_high.setCheckable(True)
-        self.btn_high.setToolTip(t("tip_clip_high"))
-        row.addWidget(self.btn_high)
         col.addLayout(row)
 
         self.plot = _HistPlot()
@@ -766,13 +754,30 @@ class Histogram(QtWidgets.QWidget):
 THUMB = 96
 
 
+def _missing_thumb(size=THUMB):
+    """a neutral chip shown in place of the thumbnail of a file that cannot be decoded, so no row is
+    ever left blank"""
+    pm = QtGui.QPixmap(size, size)
+    pm.fill(QtGui.QColor(COLORS["panel_hi"]))
+    p = QtGui.QPainter(pm)
+    p.setPen(QtGui.QPen(QtGui.QColor(COLORS["line"]), 1))
+    p.setBrush(QtCore.Qt.NoBrush)
+    p.drawRect(0, 0, size - 1, size - 1)
+    p.end()
+    return QtGui.QIcon(pm)
+
+
 class _ThumbSignals(QtCore.QObject):
     one = QtCore.Signal(int, object)
 
 
 class _ThumbTask(QtCore.QRunnable):
     """load a set of thumbnails one at a time, emitting each as it becomes ready — so a big set fills
-    in progressively instead of freezing the window"""
+    in progressively instead of freezing the window.
+
+    Every requested index is signalled exactly once: a file PIL cannot decode (a RAW, a broken JPEG)
+    still gets its index emitted, with None, instead of being dropped or cutting the batch short. So
+    no single bad photo can make the browser show only some of its thumbnails."""
 
     def __init__(self, paths, signals):
         super().__init__()
@@ -784,8 +789,8 @@ class _ThumbTask(QtCore.QRunnable):
         for i, p in enumerate(self.paths):
             try:
                 rgb = ST.thumb_rgb(ST.load_rgb(p, 512), THUMB)
-            except Exception:                  # noqa: BLE001 - an unreadable file just shows no icon
-                continue
+            except Exception:                  # noqa: BLE001 - an unreadable file gets a placeholder
+                rgb = None
             self.signals.one.emit(i, rgb)
 
 
@@ -798,6 +803,8 @@ class PortfolioDialog(QtWidgets.QDialog):
     def __init__(self, paths, parent=None):
         super().__init__(parent)
         self.setWindowTitle(t("portfolio_view_title"))
+        self.setWindowFlag(QtCore.Qt.Tool, True)     # a non-modal tool window: it never blocks the
+        self.setModal(False)                         # main window, so FIT stays usable while open
         self.resize(860, 600)
         self._paths = list(paths)
         self._guard = False
@@ -852,13 +859,19 @@ class PortfolioDialog(QtWidgets.QDialog):
         outer.addLayout(row)
 
         self._update_count()
+        # a queued connection guarantees the items are only ever touched on the GUI thread, whichever
+        # thread the worker emits from; the pool, task and signals are held for the dialog's lifetime
+        # so neither the runnable nor its signal object can be collected while it is still running
         self._signals = _ThumbSignals()
-        self._signals.one.connect(self._fill_thumb)
+        self._signals.one.connect(self._fill_thumb, QtCore.Qt.QueuedConnection)
         self._pool = QtCore.QThreadPool()
         self._task = _ThumbTask(self._paths, self._signals)
         self._pool.start(self._task)
 
     # ------------------------------------------------------------ selection
+    def paths(self):
+        return list(self._paths)
+
     def selected_paths(self):
         return [p for p, it in zip(self._paths, self._items)
                 if it.checkState() == QtCore.Qt.Checked]
@@ -904,13 +917,339 @@ class PortfolioDialog(QtWidgets.QDialog):
 
     # ------------------------------------------------------------ thumbnails
     def _fill_thumb(self, i, rgb):
-        if rgb is None or i >= len(self._items):
+        """put the decoded thumbnail — or a placeholder for an undecodable file — on row i"""
+        if i >= len(self._items):
             return
         self._guard = True
         try:
-            self._items[i].setIcon(QtGui.QIcon(QtGui.QPixmap.fromImage(ndarray_to_qimage(rgb))))
+            if rgb is None:
+                self._items[i].setIcon(_missing_thumb())
+            else:
+                self._items[i].setIcon(QtGui.QIcon(QtGui.QPixmap.fromImage(ndarray_to_qimage(rgb))))
         finally:
             self._guard = False
+
+
+class WrapDelegate(QtWidgets.QStyledItemDelegate):
+    """a long filter name wraps onto a second line instead of ending with '…', so it stays readable
+    however narrow the library panel is.  Qt does the wrapping itself; what it forgets is to make the
+    row tall enough for the wrapped text, which is all this adds."""
+
+    PAD = 6
+
+    def sizeHint(self, opt, index):
+        view = self.parent()
+        fm = QtGui.QFontMetrics(opt.font)
+        text = index.data(QtCore.Qt.DisplayRole)
+        if not text:
+            return QtCore.QSize(opt.rect.width(), fm.height() + self.PAD)
+        depth = 0
+        parent = index.parent()
+        while parent.isValid():                 # an indented row has less room than its column
+            depth += 1
+            parent = parent.parent()
+        room = view.columnWidth(index.column()) - view.indentation() * (depth + 1)
+        box = fm.boundingRect(QtCore.QRect(0, 0, max(48, room - self.PAD), 1 << 20),
+                              QtCore.Qt.TextWordWrap | QtCore.Qt.AlignLeft, str(text))
+        return QtCore.QSize(opt.rect.width(), max(fm.height(), box.height()) + self.PAD)
+
+
+class FilterManagerDialog(QtWidgets.QDialog):
+    """the PC library's own organiser: put your filters in your own order, sort them into your own
+    groups, move them about in bulk and drop the ones you no longer want.
+
+    It works on a draft, never on the disk. 应用 shows the arrangement in the main library at once so
+    you can judge it, 保存 is what writes it (deletions included), and closing without saving leaves
+    the library exactly as it was. Non-modal, so the main window stays usable while you arrange."""
+
+    applied = QtCore.Signal(list, dict, list)       # groups, {file: (group, order)}, removed files
+    saved = QtCore.Signal(list, dict, list)
+
+    _ROLE = QtCore.Qt.UserRole
+    _TO_EDGE = 10 ** 6                              # a step that lands a row at either end
+
+    def __init__(self, nodes, groups, parent=None):
+        """nodes is the library's [(group_or_None, [(recipe, file)])]; groups is every group name it
+        knows, so a group you emptied out earlier is still here to be used again"""
+        super().__init__(parent)
+        self.setWindowTitle(t("mgr_title"))
+        self.setWindowFlag(QtCore.Qt.Tool, True)    # non-modal: the library behind it stays live
+        self.setModal(False)
+        self.resize(560, 620)
+        self._removed = set()
+        held = {g: [(r, f) for r, f in items] for g, items in nodes}
+        self._state = [[g, held.pop(g, [])] for g in groups if g]
+        for g in list(held):                        # a group the name list did not know about
+            if g is not None:
+                self._state.append([g, held.pop(g)])
+        self._state.append([None, held.pop(None, [])])   # the ungrouped pile always comes last
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(9)
+        hint = QtWidgets.QLabel(t("mgr_hint"))
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.tree.setToolTip(t("mgr_tree_tip"))
+        outer.addWidget(self.tree, 1)
+
+        row = QtWidgets.QHBoxLayout()               # groups
+        self.btns_group = {}
+        for key, fn in (("mgr_new_group", self._new_group),
+                        ("mgr_ren_group", self._rename_group),
+                        ("mgr_del_group", self._delete_group)):
+            b = QtWidgets.QPushButton(t(key))
+            b.setToolTip(t("tip_" + key))
+            b.clicked.connect(fn)
+            row.addWidget(b)
+            self.btns_group[key] = b
+        row.addStretch(1)
+        self.cmb_group = QtWidgets.QComboBox()
+        self.cmb_group.setToolTip(t("tip_mgr_move"))
+        row.addWidget(self.cmb_group)
+        self.btn_move = QtWidgets.QPushButton(t("mgr_move"))
+        self.btn_move.setToolTip(t("tip_mgr_move"))
+        self.btn_move.clicked.connect(self._move_to_group)
+        row.addWidget(self.btn_move)
+        outer.addLayout(row)
+
+        row2 = QtWidgets.QHBoxLayout()              # order and deletion
+        self.btns_shift = {}
+        for key, step in (("mgr_up", -1), ("mgr_down", 1),
+                          ("mgr_top", -self._TO_EDGE), ("mgr_bottom", self._TO_EDGE)):
+            b = QtWidgets.QPushButton(t(key))
+            b.setToolTip(t("tip_" + key))
+            b.clicked.connect(lambda _=False, s=step: self._shift(s))
+            row2.addWidget(b)
+            self.btns_shift[key] = b
+        row2.addStretch(1)
+        self.btn_del_filter = QtWidgets.QPushButton(t("mgr_del_filter"))
+        self.btn_del_filter.setObjectName("Danger")
+        self.btn_del_filter.setToolTip(t("tip_mgr_del_filter"))
+        self.btn_del_filter.clicked.connect(self._delete_filter)
+        row2.addWidget(self.btn_del_filter)
+        outer.addLayout(row2)
+
+        row3 = QtWidgets.QHBoxLayout()
+        row3.addStretch(1)
+        self.btn_apply = QtWidgets.QPushButton(t("mgr_apply"))
+        self.btn_apply.setToolTip(t("tip_mgr_apply"))
+        self.btn_apply.clicked.connect(lambda: self.applied.emit(*self._collect()))
+        row3.addWidget(self.btn_apply)
+        self.btn_save = QtWidgets.QPushButton(t("mgr_save"))
+        self.btn_save.setObjectName("Accent")
+        self.btn_save.setToolTip(t("tip_mgr_save"))
+        self.btn_save.clicked.connect(self._save)
+        row3.addWidget(self.btn_save)
+        self.btn_cancel = QtWidgets.QPushButton(t("mgr_cancel"))
+        self.btn_cancel.setToolTip(t("tip_mgr_cancel"))
+        self.btn_cancel.clicked.connect(self.reject)
+        row3.addWidget(self.btn_cancel)
+        outer.addLayout(row3)
+
+        self._rebuild()
+
+    # ------------------------------------------------------------ the arrangement
+    def result_layout(self):
+        return self._collect()
+
+    def _collect(self):
+        """(groups, {file: (group, order)}, removed files) — the arrangement as the index wants it"""
+        groups, layout, order = [], {}, 0
+        for g, items in self._state:
+            if g:
+                groups.append(g)                    # kept even when empty, so the group survives
+            for _, f in items:
+                layout[f] = (g, order)
+                order += 1
+        return groups, layout, sorted(self._removed)
+
+    def _save(self):
+        self.saved.emit(*self._collect())
+        self.accept()
+
+    def _pile(self):
+        """the ungrouped group's [name, items] pair"""
+        return self._state[-1]
+
+    def _group_pair(self, name):
+        for pair in self._state:
+            if pair[0] == name:
+                return pair
+        return None
+
+    def _take(self, files):
+        """lift the named filters out of wherever they sit, keeping their on-screen order"""
+        want = set(files)
+        out = []
+        for _, items in self._state:
+            keep = []
+            for rf in items:
+                (out if rf[1] in want else keep).append(rf)
+            items[:] = keep
+        return out
+
+    # ------------------------------------------------------------ rows
+    def _label(self, group, n):
+        """the ungrouped pile is named plainly here: this dialog is all about grouping"""
+        return "%s  (%d)" % (group, n) if group else "%s  (%d)" % (t("mgr_ungrouped"), n)
+
+    def _rebuild(self, keep=None):
+        """redraw from the working state; `keep` is the [(kind, value)] to select afterwards"""
+        if keep is None:
+            keep = self._selected()
+        want = {tuple(k) for k in keep}
+        self.tree.clear()
+        for group, items in self._state:
+            node = QtWidgets.QTreeWidgetItem([self._label(group, len(items))])
+            f = node.font(0)
+            f.setBold(True)
+            node.setFont(0, f)
+            node.setData(0, self._ROLE, ("group", group or ""))
+            self.tree.addTopLevelItem(node)
+            for r, file in items:
+                it = QtWidgets.QTreeWidgetItem([r.name])
+                it.setData(0, self._ROLE, ("filter", file))
+                it.setToolTip(0, "%s\n%s" % (r.name, r.summary()))
+                node.addChild(it)
+                if tuple(it.data(0, self._ROLE)) in want:
+                    it.setSelected(True)
+            node.setExpanded(True)
+            if tuple(node.data(0, self._ROLE)) in want:
+                node.setSelected(True)
+        self._fill_groups()
+
+    def _fill_groups(self):
+        """the 移动到 list: the ungrouped pile plus every group, in the arranged order"""
+        keep = self.cmb_group.currentData()
+        self.cmb_group.clear()
+        self.cmb_group.addItem(t("mgr_ungrouped"), "")
+        self.cmb_group.setItemData(0, t("tip_mgr_ungrouped"), QtCore.Qt.ToolTipRole)
+        for group, _ in self._state:
+            if group:
+                self.cmb_group.addItem(group, group)
+                self.cmb_group.setItemData(self.cmb_group.count() - 1, t("tip_mgr_group"), QtCore.Qt.ToolTipRole)
+        i = self.cmb_group.findData(keep)
+        self.cmb_group.setCurrentIndex(i if i >= 0 else 0)
+
+    def _selected(self):
+        return [tuple(it.data(0, self._ROLE)) for it in self.tree.selectedItems()]
+
+    def _selected_files(self):
+        return [v for k, v in self._selected() if k == "filter"]
+
+    def _selected_group(self):
+        for kind, val in self._selected():
+            if kind == "group":
+                return self._group_pair(val)
+        return None
+
+    def _warn(self, message):
+        QtWidgets.QMessageBox.warning(self, t("mgr_title"), message)
+
+    def _ask_name(self, title, text):
+        out, ok = QtWidgets.QInputDialog.getText(self, title, t("mgr_group_prompt"), text=text)
+        return (out or "").strip() if ok else None
+
+    # ------------------------------------------------------------ groups
+    def _new_group(self):
+        name = self._ask_name(t("mgr_new_group"), "")
+        if name is None:
+            return
+        if not name:
+            self._warn(t("mgr_name_empty"))
+            return
+        if self._group_pair(name) is not None:
+            self._warn(t("mgr_group_exists", name))
+            return
+        self._state.insert(len(self._state) - 1, [name, []])     # above the ungrouped pile
+        self._rebuild([("group", name)])
+
+    def _rename_group(self):
+        pair = self._selected_group()
+        if pair is None or pair[0] is None:
+            self._warn(t("mgr_need_group"))
+            return
+        name = self._ask_name(t("mgr_ren_group"), pair[0])
+        if not name or name == pair[0]:
+            return
+        if self._group_pair(name) is not None:
+            self._warn(t("mgr_group_exists", name))
+            return
+        pair[0] = name
+        self._rebuild([("group", name)])
+
+    def _delete_group(self):
+        pair = self._selected_group()
+        if pair is None or pair[0] is None:
+            self._warn(t("mgr_need_group"))
+            return
+        if pair[1] and QtWidgets.QMessageBox.question(
+                self, t("mgr_del_group"),
+                t("mgr_del_group_ask", pair[0], len(pair[1]))) != QtWidgets.QMessageBox.Yes:
+            return
+        self._pile()[1].extend(pair[1])             # the filters stay, they just lose the group
+        self._state.remove(pair)
+        self._rebuild([("group", "")])
+
+    # ------------------------------------------------------------ filters
+    def _move_to_group(self):
+        files = self._selected_files()
+        if not files:
+            self._warn(t("mgr_need_filter"))
+            return
+        name = self.cmb_group.currentData()
+        dst = self._pile() if not name else self._group_pair(name)
+        moved = self._take(files)
+        dst[1].extend(moved)                        # they land at the end of the target group
+        self._rebuild([("filter", f) for _, f in moved])
+
+    def _shift(self, step):
+        """move the selection one place within its group, or right to either end of it. With nothing
+        but a group selected, the group itself moves among the other groups instead."""
+        files = self._selected_files()
+        if files:
+            want = set(files)
+            for _, items in self._state:
+                where = [i for i, (_, f) in enumerate(items) if f in want]
+                if not where:
+                    continue
+                picked = [items[i] for i in where]
+                rest = [rf for i, rf in enumerate(items) if i not in set(where)]
+                at = 0 if step < -1 else len(rest) if step > 1 else min(where) + step
+                at = max(0, min(at, len(rest)))
+                items[:] = rest[:at] + picked + rest[at:]
+            self._rebuild([("filter", f) for f in files])
+            return
+        pair = self._selected_group()
+        if pair is None or pair[0] is None:
+            self._warn(t("mgr_need_filter"))
+            return
+        i = self._state.index(pair)
+        last = len(self._state) - 2                 # never past the ungrouped pile at the end
+        j = 0 if step < -1 else last if step > 1 else max(0, min(i + step, last))
+        self._state.insert(j, self._state.pop(i))
+        self._rebuild([("group", pair[0])])
+
+    def _delete_filter(self):
+        """take the filters out of the arrangement; their files go when 保存 does"""
+        files = self._selected_files()
+        if not files:
+            self._warn(t("mgr_need_filter"))
+            return
+        if QtWidgets.QMessageBox.question(
+                self, t("mgr_del_filter"),
+                t("mgr_del_filter_ask", len(files))) != QtWidgets.QMessageBox.Yes:
+            return
+        self._take(files)
+        self._removed.update(files)
+        self._rebuild([])
 
 
 class Module(QtWidgets.QFrame):

@@ -165,6 +165,13 @@ QToolButton {{
 QToolButton:hover {{ background: {c['btn_hover']}; }}
 QToolButton:pressed {{ background: {c['btn_press']}; }}
 QToolButton:checked {{ background: {c['accent']}; border-color: {c['accent']}; color: {c['on_accent']}; }}
+QToolButton#ThemeToggle {{
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+    padding: 2px;
+}}
+QToolButton#ThemeToggle:hover {{ background: {c['panel_hi']}; }}
 
 /* ---------------- inputs ---------------- */
 QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {{

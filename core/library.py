@@ -54,6 +54,52 @@ DEFAULT_DIR = os.path.join(home(), "library")
 INDEX = "index.json"
 HISTORY_DIR = ".history"        # a dot-folder: load_dir skips it, so kept versions never enter the library
 HISTORY_KEEP = 20               # how many versions of one file to keep before the oldest are dropped
+GROUPS_KEY = "::groups"         # the user's own group names, in their own order, kept in index.json
+_BIG = 1 << 30                  # sorts an unarranged recipe after the arranged ones
+
+
+def known_groups(meta):
+    """the group names the user made, in their own order, then any only a file mentions"""
+    out = [g for g in meta.get(GROUPS_KEY, []) if isinstance(g, str) and g.strip()]
+    for m in meta.values():
+        if not isinstance(m, dict):
+            continue                        # the :: keys hold the library's own settings
+        g = (m.get("group") or "").strip()
+        if g and g not in out:
+            out.append(g)
+    return out
+
+
+def arrange(entries, meta, groups=None, layout=None, removed=()):
+    """[(group_or_None, [(recipe, file)])] — the recipes in the user's own grouping and order.
+
+    None is the ungrouped pile and always comes last. `groups` and `layout` override what the index
+    holds, so the organiser can show an arrangement before it is saved; `removed` are files it has
+    staged for deletion. A group with nothing left in it is dropped."""
+    gone = set(removed or ())
+    nodes = {}
+    for r, f in entries:
+        if f in gone:
+            continue
+        if layout is not None and f in layout:
+            g, n = layout[f]
+        else:
+            m = meta.get(f, {})
+            g, n = m.get("group"), m.get("order")
+        nodes.setdefault((g or "").strip() or None, []).append((r, f, n))
+    names = [g for g in (known_groups(meta) if groups is None else groups) if g]
+    out = []
+    for g in names:
+        if g in nodes:
+            out.append((g, nodes.pop(g)))
+    for g in list(nodes):                   # a group the list forgot, then the ungrouped pile
+        if g is not None:
+            out.append((g, nodes.pop(g)))
+    if None in nodes:
+        out.append((None, nodes.pop(None)))
+    for _, items in out:
+        items.sort(key=lambda rf: (rf[2] if rf[2] is not None else _BIG, rf[0].name.lower()))
+    return [(g, [(r, f) for r, f, _ in items]) for g, items in out]
 
 
 class Library:
@@ -73,9 +119,11 @@ class Library:
                 self.meta = json.load(open(idx_path, encoding="utf-8"))
             except (OSError, ValueError):
                 self.meta = {}
-        # drop meta for files that are gone
+        # drop meta for files that are gone; a :: key is library-level, not one file's
         files = {f for _, f in self.entries}
         for k in list(self.meta):
+            if k.startswith("::"):
+                continue
             if k not in files:
                 del self.meta[k]
         return self
@@ -136,6 +184,42 @@ class Library:
 
     def set_meta(self, file, meta):
         self.meta[file] = meta
+        self._save_index()
+
+    # ------------------------------------------------------------ the user's own grouping
+    def groups(self):
+        """the user's own group names, in the order they arranged them"""
+        return known_groups(self.meta)
+
+    def custom_groups(self):
+        """[(group_or_None, [(recipe, file)])] — the PC recipes as the user grouped and ordered them"""
+        return arrange(self.entries, self.meta)
+
+    def set_layout(self, layout, groups=None):
+        """write the organiser's arrangement: layout maps file -> (group, order), groups is the order
+        of the group names. One index write for the lot, rather than one per file."""
+        if groups is not None:
+            clean = []
+            for g in groups:
+                g = (g or "").strip()
+                if g and g not in clean:
+                    clean.append(g)
+            if clean:
+                self.meta[GROUPS_KEY] = clean
+            else:
+                self.meta.pop(GROUPS_KEY, None)
+        live = {f for _, f in self.entries}
+        for f, (g, n) in layout.items():
+            if f not in live:                # deleted since the organiser read the library
+                continue
+            m = dict(self.meta.get(f, {}))
+            g = (g or "").strip()
+            if g:
+                m["group"] = g
+            else:
+                m.pop("group", None)
+            m["order"] = int(n)
+            self.meta[f] = m
         self._save_index()
 
     # ------------------------------------------------------------ tags & favourites

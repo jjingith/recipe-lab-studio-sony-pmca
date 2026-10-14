@@ -3,6 +3,7 @@
 Import a look (cube or portfolio), fit RL recipe parameters, compare the target against the recipe's
 approximation on two preview plates, keep a PC master library, and sync the recipes to a mounted card.
 """
+import copy
 import json
 import os
 import sys
@@ -20,9 +21,9 @@ from core.recipe import Recipe
 from .i18n import (AFDIAN_URL, APP_VERSION, AUTHOR, GITHUB_URL, LANG_LABEL, LANGUAGES,
                    get_language, load_config, save_config, set_language, t)
 from .theme import COLORS, current_theme, qss, set_theme
-from .widgets import (AboutDialog, BarReadout, DropButton, Histogram, IMAGE_EXTS, ImageView,
-                      Module, ParamEditor, PortfolioDialog, ScoreStrip, SettingsDialog, SplitView,
-                      ViewState)
+from .widgets import (AboutDialog, BarReadout, DropButton, FilterManagerDialog, Histogram, IMAGE_EXTS,
+                      ImageView, Module, ParamEditor, PortfolioDialog, ScoreStrip, SettingsDialog,
+                      SplitView, ViewState, WrapDelegate, bulb_icon)
 
 
 class _WorkerSignals(QtCore.QObject):
@@ -72,7 +73,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.builtins = json.load(open(_resource("data", "builtins.json"), encoding="utf-8"))
 
         self.target_lab = None
-        self.target_cube = None
         self.target_thumb = None
         self.target_kind = None        # 'cube' | 'portfolio' | 'pair' — what the target came from
         self.target_pair_look = None   # the (after - before) Lab difference of a pair target
@@ -81,6 +81,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.src_path = None           # the preview photo's path, for its EXIF metadata line
         self.result_image = None
         self.recipe = None
+        self.current_file = None       # the library file the editor's recipe came from
+        self.lib_draft = None          # the organiser's arrangement, previewed until it is saved
+        self.manager_dlg = None        # the open organiser, if any
         self.portfolio_paths = []      # every photo imported as a colour target
         self.portfolio_selected = []   # the ticked subset a fit actually uses
         self.portfolio_dlg = None
@@ -157,15 +160,9 @@ class MainWindow(QtWidgets.QMainWindow):
         act_about.triggered.connect(self._open_about)
         m_about.addAction(act_about)
 
-        self.btn_theme = QtWidgets.QPushButton()
-        self.btn_theme.setToolTip(t("tip_theme"))
-        self.btn_theme.clicked.connect(self._toggle_theme)
-        self._update_theme_btn()
-        bar.setCornerWidget(self.btn_theme, QtCore.Qt.TopRightCorner)
-
     def _update_theme_btn(self):
-        """the button names the mode it will switch *to*"""
-        self.btn_theme.setText(t("theme_day") if current_theme() == "dark" else t("theme_night"))
+        """the bulb names the current theme: grey in night mode, yellow in day mode"""
+        self.btn_theme.setIcon(bulb_icon(current_theme() == "light"))
 
     def _toggle_theme(self):
         nxt = "light" if current_theme() == "dark" else "dark"
@@ -196,6 +193,17 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------------------------------------------------------- header
     def _header(self):
         mod = Module(t("app_name"), t("tagline"))
+
+        self.btn_theme = QtWidgets.QToolButton()
+        self.btn_theme.setObjectName("ThemeToggle")
+        self.btn_theme.setAutoRaise(True)
+        self.btn_theme.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+        self.btn_theme.setIconSize(QtCore.QSize(18, 18))
+        self.btn_theme.setToolTip(t("tip_theme"))
+        self.btn_theme.clicked.connect(self._toggle_theme)
+        self._update_theme_btn()
+        mod.add_head_widget(self.btn_theme)
+
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(14)
 
@@ -221,11 +229,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_image.dropped.connect(self._load_image_paths)
         row.addWidget(self.btn_image)
 
-        b_fit = QtWidgets.QPushButton(t("btn_fit"))
-        b_fit.setObjectName("Accent")
-        b_fit.setToolTip(t("tip_fit"))
-        b_fit.clicked.connect(self._fit)
-        row.addWidget(b_fit)
+        self.btn_fit = QtWidgets.QPushButton(t("btn_fit"))
+        self.btn_fit.setObjectName("Accent")
+        self.btn_fit.setToolTip(t("tip_fit"))
+        self.btn_fit.clicked.connect(self._fit)
+        row.addWidget(self.btn_fit)
 
         b_det = QtWidgets.QPushButton(t("btn_detect"))
         b_det.setToolTip(t("tip_detect"))
@@ -265,6 +273,11 @@ class MainWindow(QtWidgets.QMainWindow):
         mod = Module(t("mod_library"))
         self.mod_lib = mod
 
+        self.btn_mgr = QtWidgets.QPushButton(t("btn_manager"))
+        self.btn_mgr.setToolTip(t("tip_manager"))
+        self.btn_mgr.clicked.connect(self._open_manager)
+        mod.add_head_widget(self.btn_mgr)
+
         head = QtWidgets.QHBoxLayout()
         self.lbl_card = QtWidgets.QLabel(t("card_none"))
         self.lbl_card.setObjectName("Muted")
@@ -286,37 +299,35 @@ class MainWindow(QtWidgets.QMainWindow):
         mod.body.addLayout(frow)
 
         self.tree = QtWidgets.QTreeWidget()
+        self.tree.setColumnCount(2)                 # name, then the star
         self.tree.setHeaderHidden(True)
         self.tree.setIndentation(12)
         self.tree.setToolTip(t("tip_tree"))
+        self.tree.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
         self.tree.itemSelectionChanged.connect(self._on_tree_select)
         self.tree.itemDoubleClicked.connect(self._on_tree_double)
+        self.tree.itemClicked.connect(self._on_tree_clicked)
+        # a long name is wrapped onto a second line by WrapDelegate rather than ended with '…', so
+        # the name column just fills the panel and the star keeps its place at the right edge
+        self.tree.setWordWrap(True)
+        self.tree.setTextElideMode(QtCore.Qt.ElideNone)
+        self.tree.setItemDelegateForColumn(0, WrapDelegate(self.tree))
+        hd = self.tree.header()
+        hd.setStretchLastSection(False)
+        hd.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        hd.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
+        hd.resizeSection(1, 26)
+        hd.setMinimumSectionSize(20)
+        self.tree.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        hd.sectionResized.connect(lambda *_: self.tree.scheduleDelayedItemsLayout())
         mod.body.addWidget(self.tree, 1)
 
-        row = QtWidgets.QHBoxLayout()
-        for text, fn, danger, tip in [(t("btn_new"), self._new_recipe, False, t("tip_new")),
-                                      (t("btn_dup"), self._duplicate, False, t("tip_dup")),
-                                      (t("btn_del"), self._delete, True, t("tip_del"))]:
-            b = QtWidgets.QPushButton(text)
-            b.setToolTip(tip)
-            b.clicked.connect(fn)
-            if danger:
-                b.setObjectName("Danger")
-            row.addWidget(b)
-        mod.body.addLayout(row)
-
-        row3 = QtWidgets.QHBoxLayout()
-        for text, fn, tip in [(t("btn_fav"), self._toggle_fav, t("tip_fav")),
-                              (t("btn_tags"), self._edit_tags, t("tip_tags")),
-                              (t("btn_dups"), self._find_duplicates, t("tip_dups")),
-                              (t("btn_history"), self._show_history, t("tip_history"))]:
-            b = QtWidgets.QPushButton(text)
-            b.setToolTip(tip)
-            b.clicked.connect(fn)
-            row3.addWidget(b)
-        mod.body.addLayout(row3)
-
         row2 = QtWidgets.QHBoxLayout()
+        b_new = QtWidgets.QPushButton(t("btn_new"))
+        b_new.setToolTip(t("tip_new"))
+        b_new.clicked.connect(self._new_recipe)
+        row2.addWidget(b_new)
         b_push = QtWidgets.QPushButton(t("btn_push"))
         b_push.setObjectName("Launch")
         b_push.setToolTip(t("tip_push"))
@@ -480,8 +491,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.hist = Histogram()
         self.hist.mode_changed.connect(self._on_hist_mode)
-        self.hist.btn_shadow.toggled.connect(self._apply_clip)
-        self.hist.btn_high.toggled.connect(self._apply_clip)
         mod.body.addWidget(self.hist)
         return mod
 
@@ -563,7 +572,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree.clear()
         groups = {i: None for i in range(len(R.GROUPS))}
         for i, g in enumerate(R.GROUPS):
-            it = QtWidgets.QTreeWidgetItem([g])
+            it = QtWidgets.QTreeWidgetItem([g, ""])
             f = it.font(0)
             f.setBold(True)
             it.setFont(0, f)
@@ -572,39 +581,95 @@ class MainWindow(QtWidgets.QMainWindow):
             groups[i] = it
         for idx, d in enumerate(self.builtins["recipes"]):
             summ = _builtin_summary(d)
-            it = QtWidgets.QTreeWidgetItem([d["name"] + "   " + summ])
+            it = QtWidgets.QTreeWidgetItem([d["name"], ""])
             it.setData(0, QtCore.Qt.UserRole, ("builtin", idx))
             it.setForeground(0, QtGui.QColor(COLORS["muted"]))
             it.setToolTip(0, t("builtin_tip", d["name"], summ))
             groups[d["group"]].addChild(it)
             it.setHidden(fav_only or bool(q) and q not in d["name"].lower())
-        cust = QtWidgets.QTreeWidgetItem([t("custom_group", len(self.library.entries))])
-        f = cust.font(0)
-        f.setBold(True)
-        cust.setFont(0, f)
-        cust.setData(0, QtCore.Qt.UserRole, ("custgroup", None))
-        self.tree.addTopLevelItem(cust)
-        for r, file in self.library.entries:
-            m = self.library.meta_for(file)
-            tags = m.get("tags", [])
-            label = "%s%s   %s" % ("★ " if m.get("fav") else "", r.name, r.summary())
-            if tags:
-                label += "   " + " ".join("#" + t for t in tags)
-            it = QtWidgets.QTreeWidgetItem([label])
-            it.setData(0, QtCore.Qt.UserRole, ("custom", file))
-            it.setToolTip(0, "%s%s" % (r.name, ("\n" + t("tag_line", ", ".join(tags))) if tags else ""))
-            match = (not fav_only or bool(m.get("fav"))) and (
-                not q or q in r.name.lower() or any(q in t.lower() for t in tags))
-            it.setHidden(not match)
-            cust.addChild(it)
-        cust.setExpanded(True)
+        nodes = self._custom_nodes()
+        lone = len(nodes) == 1                                 # the pile alone keeps its old name
+        for name, items in nodes:
+            cust = QtWidgets.QTreeWidgetItem([self._custom_label(name, len(items), lone), ""])
+            f = cust.font(0)
+            f.setBold(True)
+            cust.setFont(0, f)
+            cust.setData(0, QtCore.Qt.UserRole, ("custgroup", name or ""))
+            self.tree.addTopLevelItem(cust)
+            for r, file in items:
+                fav = self.library.is_fav(file)
+                it = QtWidgets.QTreeWidgetItem([r.name, "★" if fav else "☆"])
+                it.setData(0, QtCore.Qt.UserRole, ("custom", file))
+                it.setToolTip(0, "%s\n%s" % (r.name, r.summary()))       # the details live on hover
+                it.setToolTip(1, t("tip_star"))
+                it.setTextAlignment(1, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+                it.setForeground(1, QtGui.QColor(COLORS["accent"] if fav else COLORS["muted"]))
+                cust.addChild(it)
+                # add it to the tree first: setHidden does nothing to a row that is not in a view yet
+                it.setHidden(not ((not fav_only or fav) and (not q or q in r.name.lower())))
+            cust.setExpanded(True)
         # while filtering, a group with nothing left to show disappears with its children
         filtering = bool(q) or fav_only
         for i in range(self.tree.topLevelItemCount()):
             top = self.tree.topLevelItem(i)
             vis = any(not top.child(j).isHidden() for j in range(top.childCount()))
             top.setHidden(filtering and not vis)
-        self.mod_lib.set_code(t("library_count", len(self.library.entries)))
+        # the header count follows the draft too, so a staged deletion is not counted here
+        drafted = len(self.lib_draft["removed"]) if self.lib_draft else 0
+        self.mod_lib.set_code(t("library_count", len(self.library.entries) - drafted))
+
+    # ---------------------------------------------------------------- the filter organiser
+    def _custom_nodes(self):
+        """[(group_or_None, [(recipe, file)])] — the PC recipes as the user grouped and ordered them.
+        While the organiser is previewing an arrangement, that one wins, so 应用 shows the result in
+        this panel without anything having been written yet."""
+        d = self.lib_draft
+        if d is None:
+            return self.library.custom_groups()
+        return LIB.arrange(self.library.entries, self.library.meta,
+                           groups=d["groups"], layout=d["layout"], removed=d["removed"])
+
+    def _custom_label(self, name, n, lone=False):
+        """a group's own name; the pile is 未分组 once there are groups to be ungrouped from, and
+        keeps the old 自定义 (PC 库) name when it is the only thing in the library"""
+        if name:
+            return "%s  (%d)" % (name, n)
+        return t("custom_group", n) if lone else "%s  (%d)" % (t("mgr_ungrouped"), n)
+
+    def _open_manager(self):
+        """open the library's own organiser: order, group, move and delete filters in bulk"""
+        if self.manager_dlg is not None:
+            self.manager_dlg.raise_()
+            self.manager_dlg.activateWindow()
+            return
+        dlg = FilterManagerDialog(self.library.custom_groups(), self.library.groups(), self)
+        dlg.setStyleSheet(qss())
+        dlg.applied.connect(self._preview_layout)
+        dlg.saved.connect(self._commit_layout)
+        dlg.finished.connect(self._manager_closed)
+        self.manager_dlg = dlg
+        dlg.show()
+
+    def _preview_layout(self, groups, layout, removed):
+        """应用: show the organiser's arrangement here at once, without writing anything"""
+        self.lib_draft = {"groups": groups, "layout": layout, "removed": set(removed)}
+        self._refresh_tree()
+        self._status(t("mgr_applied_del", len(removed)) if removed else t("mgr_applied"))
+
+    def _commit_layout(self, groups, layout, removed):
+        """保存: the only place the arrangement reaches the disk — groups, order and the deletions"""
+        for file in removed:
+            self.library.remove(file)
+        self.library.set_layout(layout, groups)
+        if self.current_file in removed:
+            self.current_file = None
+        self._status(t("mgr_saved", len(removed), len(layout)))
+
+    def _manager_closed(self, *_):
+        """either way the preview is over: the library — saved or untouched — is the truth again"""
+        self.manager_dlg = None
+        self.lib_draft = None
+        self._refresh_tree()
 
     def _on_tree_select(self):
         items = self.tree.selectedItems()
@@ -624,7 +689,41 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_tree_double(self, item, _col):
         kind, val = item.data(0, QtCore.Qt.UserRole)
         if kind == "builtin":
-            self._duplicate()
+            self._duplicate_item(kind, val)
+
+    def _on_tree_clicked(self, item, col):
+        """the star column is a button: a click on it stars or unstars the filter"""
+        if col != 1:
+            return
+        kind, val = item.data(0, QtCore.Qt.UserRole)
+        if kind == "custom":
+            self._toggle_fav_file(val)
+
+    def _tree_menu(self, pos):
+        """right-click a filter: copy / rename / delete — no room-taking buttons under the list"""
+        item = self.tree.itemAt(pos)
+        menu = self._build_tree_menu(item)
+        if menu is not None:
+            menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _build_tree_menu(self, item):
+        """the right-click menu for a filter row, or None for anything that is not one"""
+        if item is None:
+            return None
+        kind, val = item.data(0, QtCore.Qt.UserRole)
+        if kind not in ("builtin", "custom"):
+            return None
+        menu = QtWidgets.QMenu(self.tree)
+        act_dup = menu.addAction(t("menu_dup"))
+        act_ren = menu.addAction(t("menu_rename"))
+        act_del = menu.addAction(t("menu_del"))
+        act_dup.triggered.connect(lambda: self._duplicate_item(kind, val))
+        act_ren.triggered.connect(lambda: self._rename(val))
+        act_del.triggered.connect(lambda: self._delete_file(val))
+        if kind != "custom":                        # a built-in is only a source to copy from
+            act_ren.setEnabled(False)
+            act_del.setEnabled(False)
+        return menu
 
     # ================================================================ editor
     def _set_editor(self, r, name=None, file=None):
@@ -649,6 +748,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ================================================================ import
     def _import_cube(self):
+        """a .cube is a look to reproduce, not a preview of its own: fit it and put the result straight
+        into the library under the LUT's own name, selected — so importing one immediately adds a filter
+        that can be edited and pushed, and clicking any other filter still drives the preview."""
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, t("dlg_cube"), "", t("flt_cube"))
         if not path:
             return
@@ -656,16 +758,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if err:
             self._fail(t("cube_fail_title"), err)
             return
-        self.target_cube = cube
         self.target_thumb = None
         self.target_kind = "cube"
         self.target_pair_look = None
         self.target_lab = ST.target_from_cube(cube)
         self._set_target_label(t("target_cube", os.path.basename(path), cube.size))
+        if self.model is None:
+            self._fail(t("fit_title"), t("fit_not_ready"))
+            return
+        name = self._cube_filter_name(path)
+        source = os.path.basename(path)
+        target = self.target_lab
+        self._busy(True, t("fit_busy"))
+
+        def done(res):
+            params, resid = res
+            self._busy(False)
+            r = FIT.params_to_recipe(params, name=name)
+            try:
+                file = self.library.add(r, {"source": "cube:%s" % source})
+            except ValueError as e:
+                self._fail(t("save_fail_title"), str(e))
+                return
+            self._refresh_tree()
+            self._set_editor(r, file=file)
+            self._select_custom(file)
+            self._status(t("cube_filter_added", r.name, resid))
+
+        self._run(lambda: FIT.fit(self.model, target, allow_effects=self.chk_fit.isChecked()),
+                  done, lambda e: self._fail(t("fit_fail_title"), e))
         self._render_preview()
-        self._status(t("status_cube", os.path.basename(path)))
-        if self.model and self.recipe:
-            self._show_residual()
+        self._refresh_tree()
 
     def _import_portfolio(self):
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, t("dlg_portfolio"), "", t("flt_img"))
@@ -682,7 +805,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if lab is None:
             self._fail(t("btn_portfolio"), t("portfolio_noimg"))
             return
-        self.target_cube = None
         self.target_kind = "portfolio"
         self.target_pair_look = None
         self.target_lab = lab
@@ -695,9 +817,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._open_portfolio_view()
 
     def _open_portfolio_view(self):
-        """show (or re-focus) the colour-target browser, in step with the current ticks"""
+        """show (or re-focus) the colour-target browser, in step with the current ticks. A different
+        target set means a fresh browser: the reused one would still be showing the old photos, and
+        so would still be loading the old thumbnails."""
         if not self.portfolio_paths:
             return
+        if self.portfolio_dlg is not None and self.portfolio_dlg.paths() != self.portfolio_paths:
+            self.portfolio_dlg.close()
+            self.portfolio_dlg = None
         if self.portfolio_dlg is None:
             self.portfolio_dlg = PortfolioDialog(self.portfolio_paths, self)
             self.portfolio_dlg.setStyleSheet(qss())
@@ -740,7 +867,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._fail(t("pair_fail_title"), str(e))
             return
         lab, look, thumb = ST.target_from_pair(b, a)
-        self.target_cube = None
         self.target_kind = "pair"
         self.target_lab = lab
         self.target_thumb = thumb
@@ -806,23 +932,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 return "%s %d" % (base, n)
         return base
 
+    def _cube_filter_name(self, path):
+        """a camera-legal filter name taken from the LUT's file name: only the characters the name rule
+        allows, within its length limit, and unique against what the library already holds"""
+        base = os.path.splitext(os.path.basename(path))[0]
+        clean = " ".join("".join(c if R.name_char(c) else "-" for c in base).split()).strip(" -.")
+        if not clean:
+            clean = R.UNTITLED
+        clean = clean[:R.NAME_MAX].strip(" -.")
+        taken = self.library.taken_names()
+        if clean not in taken:
+            return clean
+        stem = clean[:R.NAME_MAX - 2].strip(" -.")
+        for n in range(2, 100):
+            cand = ("%s %d" % (stem, n))[:R.NAME_MAX]
+            if cand not in taken:
+                return cand
+        return clean
+
     # ================================================================ preview
     def _set_target_label(self, text):
         self.lbl_target_name.setText(text)
         self.btn_view_ws.setVisible(self.target_kind == "portfolio" and bool(self.portfolio_paths))
 
     def _preview_image(self):
-        """what the result plate shows: the photo on the bench whenever there is one — under the exact
-        cube if one is loaded, else under the recipe's approximation, else unchanged; with no photo,
-        the exact cube on the reference frame, else the portfolio thumbnail, else the recipe's blend"""
+        """what the result plate shows: the photo on the bench under the *selected filter's* simulation
+        whenever there is one; with no photo, the colour target's thumbnail, else the filter's blend.
+        The filter, never the imported target, drives the preview — so clicking a library row always
+        shows that row's look, including right after a cube has been imported and fitted."""
         if self.src_image is not None:
-            if self.target_cube is not None:
-                return self.target_cube.apply(self.src_image)
             if self.recipe is not None and self.model is not None:
                 return ST.apply_look(self.model, self.recipe.values(), self.src_image)
             return self.src_image
-        if self.target_cube is not None:
-            return self.target_cube.apply(ST.reference_rgb())
         if self.target_thumb is not None:
             return self.target_thumb
         if self.recipe is not None and self.model is not None:
@@ -831,16 +972,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_out_label(self):
         if self.src_image is None:
-            if self.target_cube is not None:
-                txt = t("out_target_cube")
-            elif self.target_kind == "pair":
+            if self.target_kind == "pair":
                 txt = t("out_pair")
             elif self.target_thumb is not None:
                 txt = t("out_portfolio")
             else:
                 txt = t("out_recipe")
-        elif self.target_cube is not None:
-            txt = t("out_cube_src")
         elif self.recipe is not None and self.model is not None:
             txt = t("out_recipe_src")
         else:
@@ -894,12 +1031,6 @@ class MainWindow(QtWidgets.QMainWindow):
         keys = ("meta_iso", "meta_shutter", "meta_aperture", "meta_focal")
         self.hist.set_meta(" · ".join(t(k, v if v else "—") for k, v in zip(keys, vals)))
 
-    def _apply_clip(self, *_):
-        shadow = self.hist.btn_shadow.isChecked()
-        high = self.hist.btn_high.isChecked()
-        for v in (self.view_src, self.view_out, self.view_split):
-            v.set_clip_flags(shadow, high)
-
     def _show_residual(self):
         if self.target_lab is None or self.recipe is None or self.model is None:
             self.lbl_residual.setText(t("residual_none"))
@@ -927,11 +1058,9 @@ class MainWindow(QtWidgets.QMainWindow):
         r = Recipe(name=self._default_fit_name(), style=1, wb_mode=R.WB_AUTO, dro=R.DRO_AUTO)
         self._set_editor(r)
 
-    def _duplicate(self):
-        items = self.tree.selectedItems()
-        if not items:
-            return
-        kind, val = items[0].data(0, QtCore.Qt.UserRole)
+    def _duplicate_item(self, kind, val):
+        """copy a filter into the editor as a new recipe — a built-in one is a starting point, a
+        custom one is a full copy saved under a fresh name"""
         if kind == "builtin":
             d = self.builtins["recipes"][val]
             r = Recipe.from_dict({k: d[k] for k in ("style", "sat", "con", "sharp", "wb_mode",
@@ -943,7 +1072,6 @@ class MainWindow(QtWidgets.QMainWindow):
         elif kind == "custom":
             r = self.library.find(val)
             if r:
-                import copy
                 r2 = copy.deepcopy(r)
                 base = r.name[:20]
                 taken = self.library.taken_names()
@@ -975,102 +1103,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_tree()
         self._select_custom(self.current_file)
 
-    def _delete(self):
-        f = getattr(self, "current_file", None)
-        if not f or not self.library.find(f):
+    def _delete_file(self, file):
+        r = self.library.find(file)
+        if not r:
             self._fail(t("del_title"), t("del_need_select"))
             return
         if QtWidgets.QMessageBox.question(self, t("del_title"),
-                                          t("del_confirm", self.library.find(f).name)
+                                          t("del_confirm", r.name)
                                           ) != QtWidgets.QMessageBox.Yes:
             return
-        self.library.remove(f)
-        self.current_file = None
+        self.library.remove(file)
+        if getattr(self, "current_file", None) == file:
+            self.current_file = None
         self._refresh_tree()
         self._status(t("del_done"))
+
+    def _rename(self, file):
+        r = self.library.find(file)
+        if not r:
+            self._fail(t("rename_title"), t("del_need_select"))
+            return
+        text, ok = QtWidgets.QInputDialog.getText(self, t("rename_title"),
+                                                  t("rename_prompt", R.NAME_MAX), text=r.name)
+        if not ok:
+            return
+        new = (text or "").strip()
+        if new == r.name:
+            return
+        r2 = copy.deepcopy(r)
+        r2.name = new
+        try:
+            new_file = self.library.update(r2, file, {"source": "rename"})
+        except ValueError as e:
+            self._fail(t("rename_title"), str(e))
+            return
+        # a rename rewrites the 8.3 file name as well, so the selection has to follow the new one
+        was_current = self.current_file == file
+        self.current_file = new_file if was_current else self.current_file
+        self._refresh_tree()
+        self._select_custom(new_file)
+        if was_current:
+            self._set_editor(r2, file=new_file)
+        self._status(t("rename_done", new))
 
     def _select_custom(self, file):
         for i in range(self.tree.topLevelItemCount()):
             top = self.tree.topLevelItem(i)
-            if top.data(0, QtCore.Qt.UserRole)[0] == "custgroup":
-                for j in range(top.childCount()):
-                    ch = top.child(j)
-                    if ch.data(0, QtCore.Qt.UserRole)[1] == file:
-                        self.tree.setCurrentItem(ch)
-                        return
+            if top.data(0, QtCore.Qt.UserRole)[0] != "custgroup":
+                continue
+            for j in range(top.childCount()):
+                ch = top.child(j)
+                if ch.data(0, QtCore.Qt.UserRole)[1] == file:
+                    self.tree.setCurrentItem(ch)
+                    ch.setSelected(True)
+                    return
 
-    # ================================================================ tags / favourites / history
-    def _current_custom_file(self):
-        items = self.tree.selectedItems()
-        if not items:
-            return None
-        kind, val = items[0].data(0, QtCore.Qt.UserRole)
-        return val if kind == "custom" else None
-
-    def _toggle_fav(self):
-        f = self._current_custom_file()
-        if not f:
-            self._fail(t("fav_title"), t("del_need_select"))
+    # ================================================================ favourites
+    def _toggle_fav_file(self, file):
+        r = self.library.find(file)
+        if not r:
             return
-        on = self.library.toggle_fav(f)
+        on = self.library.toggle_fav(file)
         self._refresh_tree()
-        self._select_custom(f)
-        self._status(t("fav_added" if on else "fav_removed", self.library.find(f).name))
-
-    def _edit_tags(self):
-        f = self._current_custom_file()
-        if not f:
-            self._fail(t("tags_title"), t("del_need_select"))
-            return
-        cur = ", ".join(self.library.tags_of(f))
-        text, ok = QtWidgets.QInputDialog.getText(self, t("tags_title"), t("tags_prompt"), text=cur)
-        if not ok:
-            return
-        self.library.set_tags(f, text.replace("，", ",").split(","))
-        self._refresh_tree()
-        self._select_custom(f)
-        self._status(t("tags_done"))
-
-    def _find_duplicates(self):
-        groups = self.library.duplicates()
-        if not groups:
-            QtWidgets.QMessageBox.information(self, t("dups_title"), t("dups_none"))
-            return
-        lines = ["、".join("『%s』" % r.name for r, _ in g) for g in groups]
-        msg = t("dups_confirm", len(groups), "\n".join(lines))
-        if QtWidgets.QMessageBox.question(self, t("dups_title"), msg) != QtWidgets.QMessageBox.Yes:
-            return
-        removed = 0
-        for g in groups:
-            for _, f in g[1:]:
-                self.library.remove(f)
-                removed += 1
-        self.current_file = None
-        self._refresh_tree()
-        self._status(t("dups_done", removed))
-
-    def _show_history(self):
-        f = self._current_custom_file()
-        if not f:
-            self._fail(t("history_title"), t("del_need_select"))
-            return
-        snaps = self.library.history(f)
-        name = self.library.find(f).name
-        if not snaps:
-            QtWidgets.QMessageBox.information(self, t("history_dlg"), t("history_none", name))
-            return
-        items = ["v%d  （%s）" % (n, os.path.basename(p)) for n, p in snaps]
-        pick, ok = QtWidgets.QInputDialog.getItem(
-            self, t("history_dlg"), t("history_prompt", name, len(snaps)),
-            items, len(items) - 1, False)
-        if not ok:
-            return
-        idx = items.index(pick)
-        self.library.restore(f, snaps[idx][1])
-        self._refresh_tree()
-        self._select_custom(f)
-        self._on_tree_select()
-        self._status(t("history_done", snaps[idx][0]))
+        self._select_custom(file)
+        self._status(t("star_add" if on else "star_remove", r.name))
 
     # ================================================================ card
     def _detect_card(self, quiet=False):

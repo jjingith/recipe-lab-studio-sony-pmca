@@ -354,4 +354,9 @@ def save_dir(directory, r, made_on=None, old_file=None):
     if os.path.exists(target):
         os.remove(target)
     os.replace(tmp, target)
+    # a rename (a new name maps to a new 8.3 file name) must not leave the old file behind
+    if old_file is not None and old_file.lower() != fname.lower():
+        old = os.path.join(directory, old_file)
+        if os.path.exists(old):
+            os.remove(old)
     return fname
