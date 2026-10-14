@@ -1,12 +1,15 @@
 """Adobe-style flat widgets: the shared zoom/pan state, the preview plate, the bar readout, the
 panel module, and the recipe parameter editor.
 """
+import os
+
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from core import ranges as R
+from core import style as ST
 from core.recipe import Recipe
-from .i18n import APP_VERSION, AUTHOR, GITHUB_URL, t
+from .i18n import APP_VERSION, AUTHOR, GITHUB_URL, load_config, save_config, t
 from .theme import COLORS
 
 # field rows: (key, label-key, kind, extra)
@@ -36,6 +39,40 @@ def ndarray_to_qimage(rgb):
     h, w = a.shape[:2]
     img = QtGui.QImage(a.tobytes(), w, h, 3 * w, QtGui.QImage.Format_RGB888)
     return img.copy()
+
+
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
+
+
+def dropped_images(event):
+    """the image paths a drag carries, in order — anything that is not an image file is skipped"""
+    out = []
+    for url in event.mimeData().urls():
+        path = url.toLocalFile()
+        if path and path.lower().endswith(IMAGE_EXTS):
+            out.append(path)
+    return out
+
+
+def clip_overlay(rgb, shadow_on=True, high_on=True):
+    """an RGBA overlay marking clipping the way Lightroom's triangles do: near-black pixels in blue,
+    near-white in red. Only the requested kinds are drawn; returns None when nothing is marked, so
+    the caller can skip the draw."""
+    if rgb is None or not (shadow_on or high_on):
+        return None
+    a = np.clip(np.asarray(rgb, float), 0.0, 1.0)
+    lum = 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
+    shadow = (lum < 0.02) if shadow_on else None
+    high = (lum > 0.98) if high_on else None
+    if not ((shadow is not None and shadow.any()) or (high is not None and high.any())):
+        return None
+    h, w = lum.shape
+    buf = np.zeros((h, w, 4), np.uint8)
+    if shadow is not None:
+        buf[shadow] = (40, 130, 255, 150)
+    if high is not None:
+        buf[high] = (255, 60, 40, 150)
+    return QtGui.QImage(buf.tobytes(), w, h, 4 * w, QtGui.QImage.Format_RGBA8888).copy()
 
 
 class ViewState(QtCore.QObject):
@@ -114,22 +151,44 @@ class ViewState(QtCore.QObject):
 
 
 class ImageView(QtWidgets.QWidget):
-    """the preview plate: an RGB array on a dark canvas, zoomed by the wheel and panned by dragging"""
+    """the preview plate: an RGB array on a canvas, zoomed by the wheel and panned by dragging.
+    Also takes a dropped image file, and can tint clipped pixels for the LR-style warnings."""
+
+    dropped = QtCore.Signal(list)
 
     def __init__(self, placeholder="NO IMAGE", state=None):
         super().__init__()
         self._img = None
+        self._rgb = None
         self._ph = placeholder
         self.state = state or ViewState()
         if state is not None:
             state.attach(self)
         self.setMinimumSize(180, 140)
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
         self._drag = None
+        self._clip_shadow = False
+        self._clip_high = False
+        self._overlay = None
+        self._drop_hot = False
 
     def set_image(self, rgb):
+        """keep the array as well as the QImage — the clipping overlay is computed from the array"""
+        self._rgb = rgb
         self._img = None if rgb is None else ndarray_to_qimage(rgb)
+        self._rebuild_overlay()
         self.update()
+
+    def set_clip_flags(self, shadow_on, high_on):
+        if (bool(shadow_on), bool(high_on)) == (self._clip_shadow, self._clip_high):
+            return
+        self._clip_shadow, self._clip_high = bool(shadow_on), bool(high_on)
+        self._rebuild_overlay()
+        self.update()
+
+    def _rebuild_overlay(self):
+        self._overlay = clip_overlay(self._rgb, self._clip_shadow, self._clip_high)
 
     # ------------------------------------------------------------ geometry
     def fitted_size(self):
@@ -151,6 +210,29 @@ class ImageView(QtWidgets.QWidget):
         cx = self.width() / 2.0 + self.state.pan[0] * fw
         cy = self.height() / 2.0 + self.state.pan[1] * fh
         return QtCore.QRectF(cx - w / 2.0, cy - h / 2.0, w, h)
+
+    # ------------------------------------------------------------ drag & drop
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            self._drop_hot = True
+            self.update()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dragLeaveEvent(self, e):
+        self._drop_hot = False
+        self.update()
+
+    def dropEvent(self, e):
+        if not e.mimeData().hasUrls():
+            return
+        e.acceptProposedAction()
+        self._drop_hot = False
+        self.update()
+        self.dropped.emit(dropped_images(e))
 
     # ------------------------------------------------------------ interaction
     def wheelEvent(self, e):
@@ -189,34 +271,69 @@ class ImageView(QtWidgets.QWidget):
         if self._img is None:
             p.setPen(QtGui.QColor(COLORS["muted"]))
             p.drawText(r, QtCore.Qt.AlignCenter, self._ph)
-            return
-        p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self.state.zoom < 2.5)
-        p.drawImage(self._draw_rect(), self._img)
+        else:
+            p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self.state.zoom < 2.5)
+            p.drawImage(self._draw_rect(), self._img)
+            if self._overlay is not None:
+                p.drawImage(self._draw_rect(), self._overlay)
+        if self._drop_hot:
+            p.setPen(QtGui.QPen(QtGui.QColor(COLORS["accent"]), 2, QtCore.Qt.DashLine))
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.drawRect(r.adjusted(2, 2, -3, -3))
 
 
 class SplitView(QtWidgets.QWidget):
-    """before/after wipe: one plate, the original left of a draggable line and the result right of it,
-    sharing the same zoom and pan as the side-by-side plates"""
+    """before/after wipe: one plate, the original on one side of a draggable line and the result on
+    the other, sharing the same zoom and pan as the side-by-side plates. The divider can be vertical
+    (wipe left/right) or horizontal (wipe top/bottom)."""
 
     GRAB = 9          # px each side of the line that grabs the divider instead of panning
+
+    dropped = QtCore.Signal(list)
 
     def __init__(self, state, placeholder="NO IMAGE"):
         super().__init__()
         self._src = None
         self._out = None
+        self._src_rgb = None
+        self._out_rgb = None
+        self._overlay_src = None
+        self._overlay_out = None
         self._ph = placeholder
         self.state = state
         state.attach(self)
         self.split = 0.5
+        self.vertical = True          # True: vertical divider, the halves wipe left/right
         self.setMinimumSize(180, 140)
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
         self._drag = None
         self._hot = False
+        self._clip_shadow = False
+        self._clip_high = False
+        self._drop_hot = False
 
     def set_images(self, src_rgb, out_rgb):
+        self._src_rgb, self._out_rgb = src_rgb, out_rgb
         self._src = None if src_rgb is None else ndarray_to_qimage(src_rgb)
         self._out = None if out_rgb is None else ndarray_to_qimage(out_rgb)
+        self._rebuild_overlays()
         self.update()
+
+    def set_orientation(self, vertical):
+        self.vertical = bool(vertical)
+        self.update()
+
+    def set_clip_flags(self, shadow_on, high_on):
+        if (bool(shadow_on), bool(high_on)) == (self._clip_shadow, self._clip_high):
+            return
+        self._clip_shadow, self._clip_high = bool(shadow_on), bool(high_on)
+        self._rebuild_overlays()
+        self.update()
+
+    def _rebuild_overlays(self):
+        self._overlay_src = clip_overlay(self._src_rgb, self._clip_shadow, self._clip_high)
+        self._overlay_out = clip_overlay(self._out_rgb, self._clip_shadow, self._clip_high)
 
     @property
     def comparable(self):
@@ -245,11 +362,40 @@ class SplitView(QtWidgets.QWidget):
         cy = self.height() / 2.0 + self.state.pan[1] * fh
         return QtCore.QRectF(cx - w / 2.0, cy - h / 2.0, w, h)
 
-    def _line_x(self):
-        return self.split * self.width()
+    def _line_pos(self):
+        return self.split * (self.width() if self.vertical else self.height())
 
     def _near_line(self, pos):
-        return self.comparable and abs(pos.x() - self._line_x()) <= self.GRAB
+        if not self.comparable:
+            return False
+        v = pos.x() if self.vertical else pos.y()
+        return abs(v - self._line_pos()) <= self.GRAB
+
+    def _split_cursor(self):
+        return QtCore.Qt.SplitHCursor if self.vertical else QtCore.Qt.SplitVCursor
+
+    # ------------------------------------------------------------ drag & drop
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            self._drop_hot = True
+            self.update()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dragLeaveEvent(self, e):
+        self._drop_hot = False
+        self.update()
+
+    def dropEvent(self, e):
+        if not e.mimeData().hasUrls():
+            return
+        e.acceptProposedAction()
+        self._drop_hot = False
+        self.update()
+        self.dropped.emit(dropped_images(e))
 
     # ------------------------------------------------------------ interaction
     def wheelEvent(self, e):
@@ -265,7 +411,7 @@ class SplitView(QtWidgets.QWidget):
         p = e.position()
         if self._near_line(p):
             self._drag = ("split", p)                     # grab the divider
-            self.setCursor(QtCore.Qt.SplitHCursor)
+            self.setCursor(self._split_cursor())
         else:
             self._drag = ("pan", p)
             self.setCursor(QtCore.Qt.ClosedHandCursor)
@@ -276,11 +422,14 @@ class SplitView(QtWidgets.QWidget):
             hot = self._near_line(p)
             if hot != self._hot:
                 self._hot = hot
-                self.setCursor(QtCore.Qt.SplitHCursor if hot else QtCore.Qt.ArrowCursor)
+                self.setCursor(self._split_cursor() if hot else QtCore.Qt.ArrowCursor)
             return
         kind, anchor = self._drag
         if kind == "split":
-            self.split = max(0.0, min(1.0, p.x() / max(1.0, float(self.width()))))
+            if self.vertical:
+                self.split = max(0.0, min(1.0, p.x() / max(1.0, float(self.width()))))
+            else:
+                self.split = max(0.0, min(1.0, p.y() / max(1.0, float(self.height()))))
             self.update()
         else:
             self.state.pan_by(self, p.x() - anchor.x(), p.y() - anchor.y())
@@ -305,6 +454,7 @@ class SplitView(QtWidgets.QWidget):
     def paintEvent(self, _):
         p = QtGui.QPainter(self)
         r = self.rect()
+        w, h = float(r.width()), float(r.height())
         p.fillRect(r, QtGui.QColor(COLORS["canvas"]))
         rect = self._draw_rect()
         if rect.isNull():
@@ -314,34 +464,97 @@ class SplitView(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self.state.zoom < 2.5)
         if self._out is not None:
             p.drawImage(rect, self._out)
+            if self._overlay_out is not None:
+                p.drawImage(rect, self._overlay_out)
         if self._src is None:
             return
         if not self.comparable:
             p.drawImage(rect, self._src)
+            if self._overlay_src is not None:
+                p.drawImage(rect, self._overlay_src)
             return
-        x = self._line_x()
-        # the original, clipped to the left of the divider
+        pos = self._line_pos()
+        # the original, clipped to its side of the divider — left when vertical, above when horizontal
+        if self.vertical:
+            clip = QtCore.QRectF(0.0, 0.0, pos, h)
+            d1, d2 = QtCore.QPointF(pos + 1.0, 0.0), QtCore.QPointF(pos + 1.0, h)
+            handle = QtCore.QRectF(pos - 7.0, h / 2.0 - 13.0, 14.0, 26.0)
+        else:
+            clip = QtCore.QRectF(0.0, 0.0, w, pos)
+            d1, d2 = QtCore.QPointF(0.0, pos + 1.0), QtCore.QPointF(w, pos + 1.0)
+            handle = QtCore.QRectF(w / 2.0 - 13.0, pos - 7.0, 26.0, 14.0)
         p.save()
-        p.setClipRect(QtCore.QRectF(0.0, 0.0, x, float(r.height())))
+        p.setClipRect(clip)
         p.drawImage(rect, self._src)
+        if self._overlay_src is not None:
+            p.drawImage(rect, self._overlay_src)
         p.restore()
         # the divider and its handle
         p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 130), 1))
-        p.drawLine(QtCore.QPointF(x + 1.0, 0.0), QtCore.QPointF(x + 1.0, float(r.height())))
+        p.drawLine(d1, d2)
         p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 210), 1))
-        p.drawLine(QtCore.QPointF(x, 0.0), QtCore.QPointF(x, float(r.height())))
-        cy = r.height() / 2.0
+        if self.vertical:
+            p.drawLine(QtCore.QPointF(pos, 0.0), QtCore.QPointF(pos, h))
+        else:
+            p.drawLine(QtCore.QPointF(0.0, pos), QtCore.QPointF(w, pos))
         p.setPen(QtCore.Qt.NoPen)
         p.setBrush(QtGui.QColor(255, 255, 255, 225))
-        p.drawRoundedRect(QtCore.QRectF(x - 7.0, cy - 13.0, 14.0, 26.0), 3.0, 3.0)
+        p.drawRoundedRect(handle, 3.0, 3.0)
         p.setPen(QtGui.QPen(QtGui.QColor(60, 60, 60, 220), 1))
-        for dy in (-4.0, 0.0, 4.0):
-            p.drawLine(QtCore.QPointF(x - 3.0, cy + dy), QtCore.QPointF(x + 3.0, cy + dy))
+        cx, cy = handle.center().x(), handle.center().y()
+        for d in (-4.0, 0.0, 4.0):
+            if self.vertical:
+                p.drawLine(QtCore.QPointF(pos - 3.0, cy + d), QtCore.QPointF(pos + 3.0, cy + d))
+            else:
+                p.drawLine(QtCore.QPointF(cx + d, pos - 3.0), QtCore.QPointF(cx + d, pos + 3.0))
         # which half is which
-        cap = QtCore.QRectF(r.left() + 7.0, r.top() + 5.0, r.width() - 14.0, 18.0)
-        p.setPen(QtGui.QColor("#e8e8e8"))
+        cap = QtCore.QRectF(r.left() + 7.0, r.top() + 5.0, w - 14.0, 18.0)
+        p.setPen(QtGui.QColor(COLORS["cap_text"]))
         p.drawText(cap, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, t("label_src"))
         p.drawText(cap, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, t("label_result"))
+        if self._drop_hot:
+            p.setPen(QtGui.QPen(QtGui.QColor(COLORS["accent"]), 2, QtCore.Qt.DashLine))
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.drawRect(r.adjusted(2, 2, -3, -3))
+
+
+class DropButton(QtWidgets.QPushButton):
+    """a push button that also accepts a dropped image (or set of images), highlighting while the
+    drag hovers over it"""
+
+    dropped = QtCore.Signal(list)
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setAcceptDrops(True)
+        self._hot = False
+
+    def _set_hot(self, on):
+        if on == self._hot:
+            return
+        self._hot = on
+        self.setProperty("dropHot", "true" if on else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            self._set_hot(True)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dragLeaveEvent(self, e):
+        self._set_hot(False)
+
+    def dropEvent(self, e):
+        if not e.mimeData().hasUrls():
+            return
+        e.acceptProposedAction()
+        self._set_hot(False)
+        self.dropped.emit(dropped_images(e))
 
 
 class BarReadout(QtWidgets.QWidget):
@@ -368,7 +581,7 @@ class BarReadout(QtWidgets.QWidget):
         r = self.rect()
         radius = max(2.0, r.height() / 2.0)
         p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(QtGui.QColor("#3a3a3a"))
+        p.setBrush(QtGui.QColor(COLORS["bar_groove"]))
         p.drawRoundedRect(QtCore.QRectF(r), radius, radius)
         w = r.width() * self._v
         if w > 0.5:
@@ -425,6 +638,279 @@ class ScoreStrip(QtWidgets.QWidget):
                 lab.setText("%s %.1f" % (base, v))
                 bar.set_value(max(0.0, 1.0 - v / 10.0), col)
         self.setToolTip(t("score_tip"))
+
+
+# ------------------------------------------------------------ histogram
+def _hist_bins(rgb):
+    """256-bin R/G/B and luma histograms of an RGB array"""
+    a = np.clip(np.asarray(rgb, float), 0.0, 1.0)
+    v = (a * 255.0 + 0.5).astype(np.uint8)
+    out = {}
+    for i, key in enumerate(("r", "g", "b")):
+        out[key] = np.bincount(v[..., i].ravel(), minlength=256).astype(np.float64)
+    lum = (0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]) * 255.0 + 0.5
+    out["l"] = np.bincount(lum.astype(np.uint8).ravel(), minlength=256).astype(np.float64)
+    return out
+
+
+class _HistPlot(QtWidgets.QWidget):
+    """the plot itself: R/G/B added together in colour, luma drawn as a line on top"""
+
+    CHANNELS = (("r", "#ff3b30"), ("g", "#32d74b"), ("b", "#0a84ff"))
+
+    def __init__(self):
+        super().__init__()
+        self._bins = None
+        self.setMinimumHeight(64)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.setFixedHeight(78)
+
+    def set_bins(self, bins):
+        self._bins = bins
+        self.update()
+
+    def _path(self, arr, peak, w, h):
+        path = QtGui.QPainterPath()
+        path.moveTo(0.0, h)
+        for i in range(256):
+            path.lineTo(w * i / 255.0, h - min(1.0, arr[i] / peak) * h)
+        path.lineTo(w, h)
+        path.closeSubpath()
+        return path
+
+    def paintEvent(self, _):
+        p = QtGui.QPainter(self)
+        r = self.rect()
+        w, h = float(r.width()), float(r.height())
+        p.fillRect(r, QtGui.QColor(COLORS["canvas"]))
+        p.setPen(QtGui.QPen(QtGui.QColor(COLORS["line"]), 1))
+        for f in (0.25, 0.5, 0.75):
+            x = w * f
+            p.drawLine(QtCore.QPointF(x, 0.0), QtCore.QPointF(x, h))
+        if self._bins is None:
+            return
+        peak = max(1.0, float(self._bins["l"].max()))
+        p.setCompositionMode(QtGui.QPainter.CompositionMode_Plus)
+        p.setPen(QtCore.Qt.NoPen)
+        for key, col in self.CHANNELS:
+            c = QtGui.QColor(col)
+            c.setAlpha(82)
+            p.setBrush(c)
+            p.drawPath(self._path(self._bins[key], peak, w, h))
+        p.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
+        p.setPen(QtGui.QPen(QtGui.QColor(COLORS["text"]), 1))
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.drawPath(self._path(self._bins["l"], peak, w, h))
+
+
+class Histogram(QtWidgets.QWidget):
+    """Lightroom's histogram block: the RGB plot, a before/after switch, the clipping toggles and the
+    exposure metadata line underneath."""
+
+    mode_changed = QtCore.Signal(str)          # 'before' | 'after'
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        col = QtWidgets.QVBoxLayout(self)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(5)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(6)
+        self.btn_mode = QtWidgets.QPushButton(t("hist_before"))
+        self.btn_mode.setCheckable(True)
+        self.btn_mode.setToolTip(t("tip_hist_switch"))
+        self.btn_mode.toggled.connect(self._on_mode)
+        row.addWidget(self.btn_mode)
+        row.addStretch(1)
+        self.btn_shadow = QtWidgets.QToolButton()
+        self.btn_shadow.setText(t("clip_shadow"))
+        self.btn_shadow.setCheckable(True)
+        self.btn_shadow.setToolTip(t("tip_clip_shadow"))
+        row.addWidget(self.btn_shadow)
+        self.btn_high = QtWidgets.QToolButton()
+        self.btn_high.setText(t("clip_high"))
+        self.btn_high.setCheckable(True)
+        self.btn_high.setToolTip(t("tip_clip_high"))
+        row.addWidget(self.btn_high)
+        col.addLayout(row)
+
+        self.plot = _HistPlot()
+        col.addWidget(self.plot)
+
+        self.lbl_meta = QtWidgets.QLabel(t("meta_none"))
+        self.lbl_meta.setObjectName("Muted")
+        col.addWidget(self.lbl_meta)
+        self._after = False
+
+    @property
+    def after_mode(self):
+        return self._after
+
+    def _on_mode(self, on):
+        self._after = bool(on)
+        self.btn_mode.setText(t("hist_after") if on else t("hist_before"))
+        self.mode_changed.emit("after" if on else "before")
+
+    def set_rgb(self, rgb):
+        self.plot.set_bins(None if rgb is None else _hist_bins(rgb))
+
+    def clear(self):
+        self.plot.set_bins(None)
+
+    def set_meta(self, text):
+        self.lbl_meta.setText(text or t("meta_none"))
+
+
+# ------------------------------------------------------------ portfolio browser
+THUMB = 96
+
+
+class _ThumbSignals(QtCore.QObject):
+    one = QtCore.Signal(int, object)
+
+
+class _ThumbTask(QtCore.QRunnable):
+    """load a set of thumbnails one at a time, emitting each as it becomes ready — so a big set fills
+    in progressively instead of freezing the window"""
+
+    def __init__(self, paths, signals):
+        super().__init__()
+        self.paths = paths
+        self.signals = signals
+
+    @QtCore.Slot()
+    def run(self):
+        for i, p in enumerate(self.paths):
+            try:
+                rgb = ST.thumb_rgb(ST.load_rgb(p, 512), THUMB)
+            except Exception:                  # noqa: BLE001 - an unreadable file just shows no icon
+                continue
+            self.signals.one.emit(i, rgb)
+
+
+class PortfolioDialog(QtWidgets.QDialog):
+    """the browser for a colour-target set: a thumbnail grid where each photo is ticked to say it
+    takes part in the fit. Non-modal, so the main window stays usable while you tick."""
+
+    selection_changed = QtCore.Signal(list)
+
+    def __init__(self, paths, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(t("portfolio_view_title"))
+        self.resize(860, 600)
+        self._paths = list(paths)
+        self._guard = False
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(8)
+
+        head = QtWidgets.QHBoxLayout()
+        self.lbl_count = QtWidgets.QLabel("")
+        head.addWidget(self.lbl_count)
+        head.addStretch(1)
+        b_all = QtWidgets.QPushButton(t("btn_all"))
+        b_all.setToolTip(t("portfolio_pick_hint"))
+        b_all.clicked.connect(lambda: self._set_all(True))
+        b_none = QtWidgets.QPushButton(t("btn_none"))
+        b_none.setToolTip(t("portfolio_pick_hint"))
+        b_none.clicked.connect(lambda: self._set_all(False))
+        head.addWidget(b_all)
+        head.addWidget(b_none)
+        outer.addLayout(head)
+
+        hint = QtWidgets.QLabel(t("portfolio_pick_hint"))
+        hint.setObjectName("Muted")
+        outer.addWidget(hint)
+
+        self.list = QtWidgets.QListWidget()
+        self.list.setViewMode(QtWidgets.QListView.IconMode)
+        self.list.setIconSize(QtCore.QSize(THUMB, THUMB))
+        self.list.setGridSize(QtCore.QSize(THUMB + 28, THUMB + 46))
+        self.list.setResizeMode(QtWidgets.QListView.Adjust)
+        self.list.setMovement(QtWidgets.QListView.Static)
+        self.list.setUniformItemSizes(True)
+        self.list.setWordWrap(True)
+        self.list.itemChanged.connect(self._on_item_changed)
+        outer.addWidget(self.list, 1)
+
+        self._items = []
+        for p in self._paths:
+            it = QtWidgets.QListWidgetItem(os.path.basename(p))
+            it.setToolTip(p)
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Checked)
+            self.list.addItem(it)
+            self._items.append(it)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        b_close = QtWidgets.QPushButton(t("about_close"))
+        b_close.clicked.connect(self.close)
+        row.addWidget(b_close)
+        outer.addLayout(row)
+
+        self._update_count()
+        self._signals = _ThumbSignals()
+        self._signals.one.connect(self._fill_thumb)
+        self._pool = QtCore.QThreadPool()
+        self._task = _ThumbTask(self._paths, self._signals)
+        self._pool.start(self._task)
+
+    # ------------------------------------------------------------ selection
+    def selected_paths(self):
+        return [p for p, it in zip(self._paths, self._items)
+                if it.checkState() == QtCore.Qt.Checked]
+
+    def sync(self, paths):
+        """set the tick state from a list of paths, without emitting (the caller already knows)"""
+        want = set(paths)
+        self._guard = True
+        for p, it in zip(self._paths, self._items):
+            it.setCheckState(QtCore.Qt.Checked if p in want else QtCore.Qt.Unchecked)
+        self._guard = False
+        self._update_count()
+
+    def _set_all(self, on):
+        self._guard = True
+        state = QtCore.Qt.Checked if on else QtCore.Qt.Unchecked
+        for it in self._items:
+            it.setCheckState(state)
+        if not on and self._items:                 # never let the set go empty
+            self._items[0].setCheckState(QtCore.Qt.Checked)
+        self._guard = False
+        self._update_count()
+        self.selection_changed.emit(self.selected_paths())
+
+    def _on_item_changed(self, item):
+        if self._guard:
+            return
+        if not self.selected_paths():
+            self._guard = True
+            item.setCheckState(QtCore.Qt.Checked)
+            self._guard = False
+            QtWidgets.QMessageBox.information(self, t("portfolio_view_title"),
+                                              t("portfolio_need_one"))
+        self._update_count()
+        self.selection_changed.emit(self.selected_paths())
+
+    def _update_count(self):
+        n = len(self.selected_paths())
+        text = t("portfolio_view_count", n, len(self._paths))
+        if n < 2:
+            text += " " + t("portfolio_few_hint")
+        self.lbl_count.setText(text)
+
+    # ------------------------------------------------------------ thumbnails
+    def _fill_thumb(self, i, rgb):
+        if rgb is None or i >= len(self._items):
+            return
+        self._guard = True
+        try:
+            self._items[i].setIcon(QtGui.QIcon(QtGui.QPixmap.fromImage(ndarray_to_qimage(rgb))))
+        finally:
+            self._guard = False
 
 
 class Module(QtWidgets.QFrame):
@@ -680,6 +1166,11 @@ class SettingsDialog(QtWidgets.QDialog):
         hint.setWordWrap(True)
         outer.addWidget(hint)
 
+        self.chk_donate = QtWidgets.QCheckBox(t("settings_donate"))
+        self.chk_donate.setToolTip(t("settings_donate_tip"))
+        self.chk_donate.setChecked(bool(load_config().get("donate_popup", True)))
+        outer.addWidget(self.chk_donate)
+
         outer.addStretch(1)
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
@@ -689,6 +1180,10 @@ class SettingsDialog(QtWidgets.QDialog):
         b_ok.clicked.connect(self.accept)
         row.addWidget(b_ok)
         outer.addLayout(row)
+
+    def accept(self):
+        save_config(donate_popup=self.chk_donate.isChecked())
+        super().accept()
 
 
 class AboutDialog(QtWidgets.QDialog):

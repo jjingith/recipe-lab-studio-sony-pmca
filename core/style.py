@@ -70,6 +70,43 @@ def load_rgb(path, max_side=1600):
     return np.asarray(im, float) / 255.0
 
 
+def _fmt_shutter(v):
+    if not v:
+        return None
+    v = float(v)
+    if v >= 1.0:
+        return ("%gs" % v)
+    return "1/%ds" % round(1.0 / v)
+
+
+def exif_summary(path):
+    """the exposure metadata shown under the histogram, read from the file's own EXIF.
+
+    Returns a dict with iso / shutter / aperture / focal, each a short formatted string or None when
+    the file has no such tag — a RAW that PIL cannot open, or a PNG, comes back all None."""
+    out = {"iso": None, "shutter": None, "aperture": None, "focal": None}
+    if not path:
+        return out
+    try:
+        with Image.open(path) as im:
+            ex = im.getexif()
+    except (OSError, ValueError):
+        return out
+    iso = ex.get(0x8827)
+    if isinstance(iso, (tuple, list)):
+        iso = iso[0] if iso else None
+    if iso:
+        out["iso"] = str(int(iso))
+    out["shutter"] = _fmt_shutter(ex.get(0x829A))
+    fnum = ex.get(0x829D)
+    if fnum:
+        out["aperture"] = "f/%g" % float(fnum)
+    focal = ex.get(0x920A)
+    if focal:
+        out["focal"] = "%gmm" % float(focal)
+    return out
+
+
 def thumb_rgb(rgb, size=128):
     a = np.clip(np.asarray(rgb, float), 0, 1)
     im = Image.fromarray((a * 255 + 0.5).astype(np.uint8)).resize((size, size), Image.LANCZOS)

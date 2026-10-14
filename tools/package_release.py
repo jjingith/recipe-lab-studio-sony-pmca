@@ -5,9 +5,10 @@ Both are built from the one exe that tools\build_exe.py produced, and land in re
   RecipeLabStudio-<ver>-portable.zip   the green build: unzip anywhere and run. library\ and
                                        settings.json are created beside the exe, so the folder is
                                        self-contained and survives being moved.
-  RecipeLabStudio-<ver>-Setup.exe      the installer: per-user (no UAC), a license page (the
-                                       free-of-charge / not-for-sale notice), a Start Menu entry,
-                                       an optional desktop shortcut, and an uninstaller.
+  RecipeLabStudio-<ver>-Setup.exe      the installer: a first page carrying the free-of-charge /
+                                       not-for-sale notice behind a tick box, a choice of installing
+                                       for all users or just this one, optional Start Menu and
+                                       desktop shortcuts (both on by default), and an uninstaller.
 
 The installer is compiled by Inno Setup's ISCC. That compiler is not vendored here; _iscc() looks
 for it in the usual places and, when it is missing, the script still builds the portable zip and

@@ -13,7 +13,8 @@ smoke test flags any entry that is missing one).
 """
 import json
 import os
-import sys
+
+from core.library import home
 
 LANG_HANS = "zh-Hans"
 LANG_HANT = "zh-Hant"
@@ -23,7 +24,8 @@ LANGUAGES = [LANG_HANS, LANG_HANT, LANG_EN]
 # ---- the release identity: the About box and the installer both read these from here -------------
 AUTHOR = "jiajun zhou"                                                   # the copyright holder
 GITHUB_URL = "https://github.com/jjingith/recipe-lab-studio-sony-pmca"   # the official release page
-APP_VERSION = "1.2"
+AFDIAN_URL = "https://afdian.com/a/jiajun2160"                           # the donation page
+APP_VERSION = "1.3"
 
 # the language names are shown in their own script in every UI language, so anyone can find theirs
 LANG_LABEL = {LANG_HANS: "简体中文", LANG_HANT: "繁體中文", LANG_EN: "English"}
@@ -221,7 +223,7 @@ STRINGS = {
 
     # ---------------------------------------------------------------- right panel
     "mod_params":      {"zh-Hans": "参数", "zh-Hant": "參數", "en": "Parameters"},
-    "name_label":      {"zh-Hans": "NAME", "zh-Hant": "NAME", "en": "NAME"},
+    "name_label":      {"zh-Hans": "名称", "zh-Hant": "名稱", "en": "Name"},
     "name_ph":         {"zh-Hans": "≤24 字符，字母数字与 {0}", "zh-Hant": "≤24 字元，字母數字與 {0}",
                         "en": "≤24 chars, letters/digits and {0}"},
     "btn_save":        {"zh-Hans": "保存到库", "zh-Hant": "儲存到庫", "en": "Save to library"},
@@ -561,18 +563,116 @@ STRINGS = {
                               "the CPU, with identical results."},
     "btn_ok":          {"zh-Hans": "确定", "zh-Hant": "確定", "en": "OK"},
     "tip_ok":          {"zh-Hans": "关闭设置", "zh-Hant": "關閉設定", "en": "Close settings"},
+
+    # ---------------------------------------------------------------- theme / workspace
+    "settings_action": {"zh-Hans": "图像处理方式…", "zh-Hant": "影像處理方式…",
+                        "en": "Image processing…"},
+    "theme_day":       {"zh-Hans": "日间模式", "zh-Hant": "日間模式", "en": "Day mode"},
+    "theme_night":     {"zh-Hans": "夜间模式", "zh-Hant": "夜間模式", "en": "Night mode"},
+    "tip_theme":       {"zh-Hans": "在黑夜 / 日间配色之间切换（立即生效）",
+                        "zh-Hant": "在黑／日間配色之間切換（立即生效）",
+                        "en": "Switch between the dark and light colour schemes (takes effect at once)"},
+    "btn_save_ws":     {"zh-Hans": "保存工作区", "zh-Hant": "儲存工作區", "en": "Save workspace"},
+    "tip_save_ws":     {"zh-Hans": "记住当前三个面板的宽度和窗口大小，下次启动自动恢复",
+                        "zh-Hant": "記住當前三個面板的寬度與視窗大小，下次啟動自動還原",
+                        "en": "Remember the current panel widths and window size, restored on the "
+                              "next launch"},
+    "ws_saved":        {"zh-Hans": "工作区已保存，下次启动自动恢复。",
+                        "zh-Hant": "工作區已儲存，下次啟動自動還原。",
+                        "en": "Workspace saved; it will be restored on the next launch."},
+
+    # ---------------------------------------------------------------- compare orientation
+    "btn_orient_h":    {"zh-Hans": "横线", "zh-Hant": "橫線", "en": "Horizontal"},
+    "btn_orient_v":    {"zh-Hans": "竖线", "zh-Hant": "豎線", "en": "Vertical"},
+    "tip_orient":      {"zh-Hans": "切换对比分界线方向：横线（上下擦除）/ 竖线（左右擦除）",
+                        "zh-Hant": "切換對比分界線方向：橫線（上下擦除）／豎線（左右擦除）",
+                        "en": "Flip the divider: horizontal (wipe top/bottom) or vertical "
+                              "(wipe left/right)"},
+
+    # ---------------------------------------------------------------- drag & drop
+    "drop_bad":        {"zh-Hans": "只支持拖入图片文件（jpg / png / tif …）。",
+                        "zh-Hant": "只支援拖入圖片檔（jpg / png / tif …）。",
+                        "en": "Only image files can be dropped here (jpg / png / tif …)."},
+    "tip_drop_preview": {"zh-Hans": "也可以直接把一张图片拖到这里当预览图",
+                         "zh-Hant": "也可以直接把一張圖片拖到這裡當預覽圖",
+                         "en": "You can also drop an image straight onto here to preview it"},
+    "tip_drop_portfolio": {"zh-Hans": "也可以直接把多张图片拖到这里，导入为追色目标作品",
+                           "zh-Hant": "也可以直接把多張圖片拖到這裡，匯入為追色目標作品",
+                           "en": "You can also drop several images straight onto here to import "
+                                 "them as a colour target"},
+
+    # ---------------------------------------------------------------- portfolio browser
+    "portfolio_view_title": {"zh-Hans": "追色目标作品", "zh-Hant": "追色目標作品",
+                             "en": "Colour target"},
+    "portfolio_view_count": {"zh-Hans": "已选 {0} / 共 {1} 张", "zh-Hant": "已選 {0} / 共 {1} 張",
+                             "en": "{0} of {1} selected"},
+    "portfolio_pick_hint": {"zh-Hans": "只有勾选的照片会参与 FIT 拟合。",
+                            "zh-Hant": "只有勾選的照片會參與 FIT 擬合。",
+                            "en": "Only the ticked photos are used when you fit."},
+    "portfolio_need_one": {"zh-Hans": "至少要保留一张照片。", "zh-Hant": "至少要保留一張照片。",
+                           "en": "At least one photo has to stay selected."},
+    "portfolio_few_hint": {"zh-Hans": "（少于 2 张时统计意义会变弱）",
+                           "zh-Hant": "（少於 2 張時統計意義會變弱）",
+                           "en": "(with fewer than 2, the statistics get weak)"},
+    "btn_all":         {"zh-Hans": "全选", "zh-Hant": "全選", "en": "Select all"},
+    "btn_none":        {"zh-Hans": "全不选", "zh-Hant": "全不選", "en": "Select none"},
+    "btn_ws_view":     {"zh-Hans": "查看作品集", "zh-Hant": "檢視作品集", "en": "View target"},
+    "tip_ws_view":     {"zh-Hans": "打开浏览窗口，勾选参与拟合的照片",
+                        "zh-Hant": "開啟瀏覽視窗，勾選參與擬合的照片",
+                        "en": "Open the browser to tick which photos take part in the fit"},
+
+    # ---------------------------------------------------------------- histogram / metadata
+    "hist_title":      {"zh-Hans": "直方图", "zh-Hant": "直方圖", "en": "Histogram"},
+    "hist_before":     {"zh-Hans": "应用滤镜前", "zh-Hant": "套用濾鏡前", "en": "Before"},
+    "hist_after":      {"zh-Hans": "应用滤镜后", "zh-Hant": "套用濾鏡後", "en": "After"},
+    "tip_hist_switch": {"zh-Hans": "切换直方图：应用滤镜前（原片）/ 应用滤镜后（结果图）",
+                        "zh-Hant": "切換直方圖：套用濾鏡前（原片）／套用濾鏡後（結果圖）",
+                        "en": "Switch the histogram between before (the original) and after "
+                              "(the result)"},
+    "clip_shadow":     {"zh-Hans": "阴影剪切", "zh-Hant": "陰影剪裁", "en": "Shadow clip"},
+    "clip_high":       {"zh-Hans": "高光剪切", "zh-Hant": "高光剪裁", "en": "Highlight clip"},
+    "tip_clip_shadow": {"zh-Hans": "在预览图上用蓝色标出接近纯黑的像素",
+                        "zh-Hant": "在預覽圖上用藍色標出接近純黑的像素",
+                        "en": "Tint near-black pixels blue on the preview"},
+    "tip_clip_high":   {"zh-Hans": "在预览图上用红色标出接近纯白的像素",
+                        "zh-Hant": "在預覽圖上用紅色標出接近純白的像素",
+                        "en": "Tint near-white pixels red on the preview"},
+    "meta_iso":        {"zh-Hans": "ISO {0}", "zh-Hant": "ISO {0}", "en": "ISO {0}"},
+    "meta_shutter":    {"zh-Hans": "快门 {0}", "zh-Hant": "快門 {0}", "en": "Shutter {0}"},
+    "meta_aperture":   {"zh-Hans": "光圈 {0}", "zh-Hant": "光圈 {0}", "en": "Aperture {0}"},
+    "meta_focal":      {"zh-Hans": "焦距 {0}", "zh-Hant": "焦距 {0}", "en": "Focal {0}"},
+    "meta_none":       {"zh-Hans": "无 EXIF 信息", "zh-Hant": "無 EXIF 資訊",
+                        "en": "No EXIF data"},
+
+    # ---------------------------------------------------------------- donation pop-up
+    "donate_title":    {"zh-Hans": "请我喝杯咖啡？", "zh-Hant": "請我喝杯咖啡？",
+                        "en": "Buy me a coffee?"},
+    "donate_body": {
+        "zh-Hans": "这个软件一直免费，也会继续免费，没有付费版。如果它帮你省了事，欢迎到爱发电"
+                   "请我喝杯咖啡 —— 打赏完全自愿，不会获得额外功能或优先支持，软件对所有用户"
+                   "一视同仁。",
+        "zh-Hant": "這個軟體一直免費，也會繼續免費，沒有付費版。如果它幫你省了事，歡迎到愛發電"
+                   "請我喝杯咖啡 —— 打賞完全自願，不會獲得額外功能或優先支援，軟體對所有使用者"
+                   "一視同仁。",
+        "en": "This software is free, and will stay free — there is no paid edition. If it saved "
+              "you some work, you are welcome to buy me a coffee on Afdian. Donating is entirely "
+              "voluntary: it unlocks no extra feature and no priority support, and every user is "
+              "treated the same."},
+    "donate_btn_open": {"zh-Hans": "打开爱发电", "zh-Hant": "開啟愛發電", "en": "Open Afdian"},
+    "donate_btn_close": {"zh-Hans": "以后再说", "zh-Hant": "以後再說", "en": "Maybe later"},
+    "donate_chk_hide": {"zh-Hans": "不再显示这个提醒", "zh-Hant": "不再顯示這個提醒",
+                        "en": "Do not show this again"},
+    "settings_donate": {"zh-Hans": "启动时显示爱发电支持提醒",
+                        "zh-Hant": "啟動時顯示愛發電支持提醒",
+                        "en": "Show the Afdian support reminder at start-up"},
+    "settings_donate_tip": {"zh-Hans": "取消勾选后，程序启动时不再弹出支持提醒",
+                            "zh-Hant": "取消勾選後，程式啟動時不再彈出支持提醒",
+                            "en": "When unticked, the support reminder no longer appears at start-up"},
 }
 
 
 # ------------------------------------------------------------ state / config
-def _home():
-    """the writable folder next to the exe (frozen) or the project root (source), as in library.py"""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-SETTINGS_PATH = os.path.join(_home(), "settings.json")
+SETTINGS_PATH = os.path.join(home(), "settings.json")
 
 _current = LANG_HANS
 

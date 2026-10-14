@@ -14,17 +14,43 @@ from . import recipe as RC
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-
-def _home():
-    """where the user's recipes live: next to the exe when frozen — a onefile build unpacks to a
-    throwaway temp folder, so ROOT would take the library with it on every launch — and the project
-    root when running from source"""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return ROOT
+_APP_DIR = "RecipeLabStudio"
+_home_cache = None
 
 
-DEFAULT_DIR = os.path.join(_home(), "library")
+def _writable(d):
+    """can we actually create a file in `d`? os.access is unreliable on Windows (it looks at the
+    read-only attribute, not the ACL), so probe for real"""
+    try:
+        os.makedirs(d, exist_ok=True)
+        probe = os.path.join(d, ".write-probe")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def home():
+    """where the user's recipes and settings live.
+
+    Next to the exe when frozen — a onefile build unpacks to a throwaway temp folder, so ROOT would
+    take the library with it on every launch — and the project root when running from source. When
+    that folder is not writable (an all-users install under Program Files), fall back to the user's
+    own %APPDATA%, so saving recipes and settings still works. Cached for the session."""
+    global _home_cache
+    if _home_cache is None:
+        base = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else ROOT
+        if _writable(base):
+            _home_cache = base
+        else:
+            appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+            _home_cache = os.path.join(appdata, _APP_DIR)
+    return _home_cache
+
+
+DEFAULT_DIR = os.path.join(home(), "library")
 INDEX = "index.json"
 HISTORY_DIR = ".history"        # a dot-folder: load_dir skips it, so kept versions never enter the library
 HISTORY_KEEP = 20               # how many versions of one file to keep before the oldest are dropped

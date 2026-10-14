@@ -7,7 +7,6 @@ import json
 import os
 import sys
 
-import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from core import card as CARD
@@ -18,11 +17,12 @@ from core import style as ST
 from core.cube import load_safe
 from core.model import Model, confidence
 from core.recipe import Recipe
-from .i18n import (APP_VERSION, AUTHOR, GITHUB_URL, LANG_LABEL, LANGUAGES, get_language,
-                   save_config, set_language, t)
-from .theme import COLORS, qss
-from .widgets import (AboutDialog, BarReadout, ImageView, Module, ParamEditor, ScoreStrip,
-                      SettingsDialog, SplitView, ViewState)
+from .i18n import (AFDIAN_URL, APP_VERSION, AUTHOR, GITHUB_URL, LANG_LABEL, LANGUAGES,
+                   get_language, load_config, save_config, set_language, t)
+from .theme import COLORS, current_theme, qss, set_theme
+from .widgets import (AboutDialog, BarReadout, DropButton, Histogram, IMAGE_EXTS, ImageView,
+                      Module, ParamEditor, PortfolioDialog, ScoreStrip, SettingsDialog, SplitView,
+                      ViewState)
 
 
 class _WorkerSignals(QtCore.QObject):
@@ -53,6 +53,11 @@ def _resource(*parts):
     return os.path.join(base, *parts)
 
 
+def _b64(data):
+    """a QByteArray (the splitter state, the window geometry) as text for settings.json"""
+    return bytes(data.toBase64()).decode("ascii")
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -73,13 +78,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.target_pair_look = None   # the (after - before) Lab difference of a pair target
         self.base_lab = None           # the reference frame's own appearance, for the score bands
         self.src_image = None
+        self.src_path = None           # the preview photo's path, for its EXIF metadata line
         self.result_image = None
         self.recipe = None
+        self.portfolio_paths = []      # every photo imported as a colour target
+        self.portfolio_selected = []   # the ticked subset a fit actually uses
+        self.portfolio_dlg = None
 
         self.pool = QtCore.QThreadPool()
         self._workers = set()          # holds every running worker, see _run()
         self.view_state = ViewState()  # zoom/pan shared by the two preview plates
         self._build_ui()
+        self._restore_workspace()
         self._refresh_tree()
         self._detect_card(quiet=True)
         self._start()
@@ -92,12 +102,22 @@ class MainWindow(QtWidgets.QMainWindow):
         root.setContentsMargins(14, 12, 14, 8)
         root.setSpacing(11)
         root.addWidget(self._header())
-        body = QtWidgets.QHBoxLayout()
-        body.setSpacing(11)
-        body.addWidget(self._left_panel(), 3)
-        body.addWidget(self._center_panel(), 6)
-        body.addWidget(self._right_panel(), 4)
-        root.addLayout(body, 1)
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.splitter.setObjectName("MainSplit")
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(6)
+        left, center, right = self._left_panel(), self._center_panel(), self._right_panel()
+        left.setMinimumWidth(240)
+        center.setMinimumWidth(360)
+        right.setMinimumWidth(300)
+        self.splitter.addWidget(left)
+        self.splitter.addWidget(center)
+        self.splitter.addWidget(right)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 6)
+        self.splitter.setStretchFactor(2, 4)
+        self.splitter.setSizes([330, 660, 440])
+        root.addWidget(self.splitter, 1)
         self.setCentralWidget(central)
 
         bar = QtWidgets.QStatusBar()
@@ -127,10 +147,38 @@ class MainWindow(QtWidgets.QMainWindow):
             group.addAction(act)
             m_lang.addAction(act)
 
+        m_set = bar.addMenu(t("settings"))
+        act_set = QtGui.QAction(t("settings_action"), self)
+        act_set.triggered.connect(self._open_settings)
+        m_set.addAction(act_set)
+
         m_about = bar.addMenu(t("menu_about"))
         act_about = QtGui.QAction(t("about_action"), self)
         act_about.triggered.connect(self._open_about)
         m_about.addAction(act_about)
+
+        self.btn_theme = QtWidgets.QPushButton()
+        self.btn_theme.setToolTip(t("tip_theme"))
+        self.btn_theme.clicked.connect(self._toggle_theme)
+        self._update_theme_btn()
+        bar.setCornerWidget(self.btn_theme, QtCore.Qt.TopRightCorner)
+
+    def _update_theme_btn(self):
+        """the button names the mode it will switch *to*"""
+        self.btn_theme.setText(t("theme_day") if current_theme() == "dark" else t("theme_night"))
+
+    def _toggle_theme(self):
+        nxt = "light" if current_theme() == "dark" else "dark"
+        set_theme(nxt)
+        save_config(theme=nxt)
+        self.setStyleSheet(qss())
+        self._update_theme_btn()
+        self._refresh_tree()                    # the built-in rows carry an explicit muted colour
+        self.view_state.notify()
+        self._show_residual()
+        self._refresh_hist()
+        if self.portfolio_dlg is not None:
+            self.portfolio_dlg.setStyleSheet(qss())
 
     def _switch_language(self, code):
         if code == get_language():
@@ -150,27 +198,62 @@ class MainWindow(QtWidgets.QMainWindow):
         mod = Module(t("app_name"), t("tagline"))
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(14)
-        for text, fn, style, tip in [
-            (t("btn_import_cube"), self._import_cube, "", t("tip_import_cube")),
-            (t("btn_portfolio"), self._import_portfolio, "", t("tip_portfolio")),
-            (t("btn_pair"), self._import_pair, "", t("tip_pair")),
-            (t("btn_open_image"), self._load_image, "", t("tip_open_image")),
-            (t("btn_fit"), self._fit, "Accent", t("tip_fit")),
-            (t("btn_detect"), lambda: self._detect_card(), "", t("tip_detect")),
-        ]:
-            b = QtWidgets.QPushButton(text)
-            b.setToolTip(tip)
-            b.clicked.connect(fn)
-            if style:
-                b.setObjectName(style)
-            row.addWidget(b)
+
+        b_cube = QtWidgets.QPushButton(t("btn_import_cube"))
+        b_cube.setToolTip(t("tip_import_cube"))
+        b_cube.clicked.connect(self._import_cube)
+        row.addWidget(b_cube)
+
+        self.btn_portfolio = DropButton(t("btn_portfolio"))
+        self.btn_portfolio.setToolTip(t("tip_portfolio") + "\n" + t("tip_drop_portfolio"))
+        self.btn_portfolio.clicked.connect(self._import_portfolio)
+        self.btn_portfolio.dropped.connect(self._import_portfolio_paths)
+        row.addWidget(self.btn_portfolio)
+
+        b_pair = QtWidgets.QPushButton(t("btn_pair"))
+        b_pair.setToolTip(t("tip_pair"))
+        b_pair.clicked.connect(self._import_pair)
+        row.addWidget(b_pair)
+
+        self.btn_image = DropButton(t("btn_open_image"))
+        self.btn_image.setToolTip(t("tip_open_image") + "\n" + t("tip_drop_preview"))
+        self.btn_image.clicked.connect(self._load_image)
+        self.btn_image.dropped.connect(self._load_image_paths)
+        row.addWidget(self.btn_image)
+
+        b_fit = QtWidgets.QPushButton(t("btn_fit"))
+        b_fit.setObjectName("Accent")
+        b_fit.setToolTip(t("tip_fit"))
+        b_fit.clicked.connect(self._fit)
+        row.addWidget(b_fit)
+
+        b_det = QtWidgets.QPushButton(t("btn_detect"))
+        b_det.setToolTip(t("tip_detect"))
+        b_det.clicked.connect(lambda: self._detect_card())
+        row.addWidget(b_det)
+
         row.addStretch(1)
-        b_set = QtWidgets.QPushButton(t("settings"))
-        b_set.setToolTip(t("tip_settings"))
-        b_set.clicked.connect(self._open_settings)
-        row.addWidget(b_set)
+        b_ws = QtWidgets.QPushButton(t("btn_save_ws"))
+        b_ws.setToolTip(t("tip_save_ws"))
+        b_ws.clicked.connect(self._save_workspace)
+        row.addWidget(b_ws)
         mod.body.addLayout(row)
         return mod
+
+    # ---------------------------------------------------------------- workspace
+    def _save_workspace(self):
+        save_config(workspace=_b64(self.splitter.saveState()),
+                    geometry=_b64(self.saveGeometry()))
+        self._status(t("ws_saved"))
+
+    def _restore_workspace(self):
+        cfg = load_config()
+        geo = cfg.get("geometry")
+        if geo:
+            self.restoreGeometry(QtCore.QByteArray.fromBase64(geo.encode("ascii")))
+        ws = cfg.get("workspace")
+        if ws:
+            self.splitter.restoreState(QtCore.QByteArray.fromBase64(ws.encode("ascii")))
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
@@ -179,7 +262,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------------------------------------------------------- left
     def _left_panel(self):
-        mod = Module(t("mod_library"), "LIBRARY")
+        mod = Module(t("mod_library"))
         self.mod_lib = mod
 
         head = QtWidgets.QHBoxLayout()
@@ -255,7 +338,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------------------------------------------------------- center
     def _center_panel(self):
-        mod = Module(t("mod_preview"), "PREVIEW")
+        mod = Module(t("mod_preview"))
         self.mod_mon = mod
 
         self.btn_compare = QtWidgets.QPushButton(t("btn_compare"))
@@ -263,6 +346,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_compare.setToolTip(t("tip_compare"))
         self.btn_compare.toggled.connect(self._toggle_compare)
         mod.add_head_widget(self.btn_compare)
+
+        self.btn_orient = QtWidgets.QPushButton(t("btn_orient_h"))
+        self.btn_orient.setToolTip(t("tip_orient"))
+        self.btn_orient.clicked.connect(self._toggle_orient)
+        self.btn_orient.hide()
+        mod.add_head_widget(self.btn_orient)
 
         # -- the side-by-side plates
         pair = QtWidgets.QHBoxLayout()
@@ -272,14 +361,16 @@ class MainWindow(QtWidgets.QMainWindow):
         lab_src.setObjectName("Stencil")
         left.addWidget(lab_src)
         self.view_src = ImageView(t("no_image"), self.view_state)
-        self.view_src.setToolTip(t("tip_view"))
+        self.view_src.setToolTip(t("tip_view") + "\n" + t("tip_drop_preview"))
+        self.view_src.dropped.connect(self._load_image_paths)
         left.addWidget(self.view_src, 1)
         right = QtWidgets.QVBoxLayout()
         self.lbl_result = QtWidgets.QLabel(t("label_result"))
         self.lbl_result.setObjectName("Stencil")
         right.addWidget(self.lbl_result)
         self.view_out = ImageView(t("no_image"), self.view_state)
-        self.view_out.setToolTip(t("tip_view"))
+        self.view_out.setToolTip(t("tip_view") + "\n" + t("tip_drop_preview"))
+        self.view_out.dropped.connect(self._load_image_paths)
         right.addWidget(self.view_out, 1)
         pair.addLayout(left, 1)
         pair.addLayout(right, 1)
@@ -289,7 +380,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # -- the wipe plate, shown instead of them when 对比视图 is on
         self.view_split = SplitView(self.view_state, t("no_image"))
-        self.view_split.setToolTip(t("tip_split"))
+        self.view_split.setToolTip(t("tip_split") + "\n" + t("tip_drop_preview"))
+        self.view_split.dropped.connect(self._load_image_paths)
         self.view_split.hide()
         mod.body.addWidget(self.view_split, 1)
 
@@ -303,6 +395,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_target_name = QtWidgets.QLabel(t("target_none"))
         self.lbl_target_name.setObjectName("Muted")
         meta.addWidget(self.lbl_target_name)
+        self.btn_view_ws = QtWidgets.QPushButton(t("btn_ws_view"))
+        self.btn_view_ws.setToolTip(t("tip_ws_view"))
+        self.btn_view_ws.clicked.connect(self._open_portfolio_view)
+        self.btn_view_ws.hide()
+        meta.addWidget(self.btn_view_ws)
         self.lbl_zoom = QtWidgets.QLabel("100%")
         self.lbl_zoom.setObjectName("Muted")
         self.lbl_zoom.setMinimumWidth(38)
@@ -331,12 +428,19 @@ class MainWindow(QtWidgets.QMainWindow):
         """swap the two plates for the single wipe plate (and back), then re-clamp the shared pan"""
         self.pair_widget.setVisible(not on)
         self.view_split.setVisible(on)
+        self.btn_orient.setVisible(on)
         self.view_split.set_images(self.src_image, self.result_image)
         self.view_state.notify()
 
+    def _toggle_orient(self):
+        """flip the wipe divider between vertical and horizontal; the button names where it goes"""
+        vertical = not self.view_split.vertical
+        self.view_split.set_orientation(vertical)
+        self.btn_orient.setText(t("btn_orient_h") if vertical else t("btn_orient_v"))
+
     # ---------------------------------------------------------------- right
     def _right_panel(self):
-        mod = Module(t("mod_params"), "PARAMETERS")
+        mod = Module(t("mod_params"))
         self.mod_set = mod
 
         nrow = QtWidgets.QHBoxLayout()
@@ -373,12 +477,54 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(b_save)
         row.addWidget(b_reset)
         mod.body.addLayout(row)
+
+        self.hist = Histogram()
+        self.hist.mode_changed.connect(self._on_hist_mode)
+        self.hist.btn_shadow.toggled.connect(self._apply_clip)
+        self.hist.btn_high.toggled.connect(self._apply_clip)
+        mod.body.addWidget(self.hist)
         return mod
 
     # ================================================================ start
     def _start(self):
         self._status(t("start_status"))
         QtCore.QTimer.singleShot(200, self._ensure_model)
+        QtCore.QTimer.singleShot(500, self._maybe_donate)
+
+    def _maybe_donate(self):
+        """the start-up reminder, unless the user has turned it off (settings or 「不再显示」)"""
+        if not load_config().get("donate_popup", True):
+            return
+        box = QtWidgets.QDialog(self)
+        box.setWindowTitle(t("donate_title"))
+        box.setMinimumWidth(470)
+        outer = QtWidgets.QVBoxLayout(box)
+        outer.setContentsMargins(18, 16, 18, 14)
+        outer.setSpacing(10)
+        title = QtWidgets.QLabel(t("donate_title"))
+        title.setObjectName("AppTitle")
+        outer.addWidget(title)
+        body = QtWidgets.QLabel(t("donate_body"))
+        body.setObjectName("Muted")
+        body.setWordWrap(True)
+        outer.addWidget(body)
+        chk = QtWidgets.QCheckBox(t("donate_chk_hide"))
+        outer.addWidget(chk)
+        row = QtWidgets.QHBoxLayout()
+        b_open = QtWidgets.QPushButton(t("donate_btn_open"))
+        b_open.setObjectName("Accent")
+        b_open.setToolTip(AFDIAN_URL)
+        b_open.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl(AFDIAN_URL)))
+        b_close = QtWidgets.QPushButton(t("donate_btn_close"))
+        b_close.clicked.connect(box.accept)
+        row.addWidget(b_open)
+        row.addStretch(1)
+        row.addWidget(b_close)
+        outer.addLayout(row)
+        box.setStyleSheet(qss())
+        box.exec()
+        if chk.isChecked():
+            save_config(donate_popup=False)
 
     # ================================================================ workers
     def _run(self, fn, on_done, on_fail):
@@ -523,9 +669,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _import_portfolio(self):
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, t("dlg_portfolio"), "", t("flt_img"))
-        if not files:
+        if files:
+            self._import_portfolio_paths(files)
+
+    def _import_portfolio_paths(self, paths):
+        """a set of photos becomes the colour target; the browser opens so you can pick which count"""
+        paths = [p for p in paths if p.lower().endswith(IMAGE_EXTS)]
+        if not paths:
+            self._status(t("drop_bad"))
             return
-        lab, thumb = ST.target_from_portfolio(files)
+        lab, thumb = ST.target_from_portfolio(paths)
         if lab is None:
             self._fail(t("btn_portfolio"), t("portfolio_noimg"))
             return
@@ -534,9 +687,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.target_pair_look = None
         self.target_lab = lab
         self.target_thumb = thumb
-        self._set_target_label(t("target_portfolio", len(files)))
+        self.portfolio_paths = list(paths)
+        self.portfolio_selected = list(paths)
+        self._set_target_label(t("target_portfolio", len(paths)))
         self._render_preview()
-        self._status(t("status_portfolio", len(files)))
+        self._status(t("status_portfolio", len(paths)))
+        self._open_portfolio_view()
+
+    def _open_portfolio_view(self):
+        """show (or re-focus) the colour-target browser, in step with the current ticks"""
+        if not self.portfolio_paths:
+            return
+        if self.portfolio_dlg is None:
+            self.portfolio_dlg = PortfolioDialog(self.portfolio_paths, self)
+            self.portfolio_dlg.setStyleSheet(qss())
+            self.portfolio_dlg.selection_changed.connect(self._on_portfolio_selection)
+        else:
+            self.portfolio_dlg.sync(self.portfolio_selected)
+        self.portfolio_dlg.show()
+        self.portfolio_dlg.raise_()
+        self.portfolio_dlg.activateWindow()
+
+    def _on_portfolio_selection(self, paths):
+        """re-take the signature from just the ticked photos — this is what a fit will aim at"""
+        if not paths:
+            return
+        lab, thumb = ST.target_from_portfolio(paths)
+        if lab is None:
+            self._status(t("portfolio_noimg"))
+            return
+        self.portfolio_selected = list(paths)
+        self.target_kind = "portfolio"
+        self.target_lab = lab
+        self.target_thumb = thumb
+        self._set_target_label(t("target_portfolio", len(paths)))
+        self._render_preview()
 
     def _import_pair(self):
         """estimate a look from a before/after pair: the same scene, graded — the difference is the
@@ -568,19 +753,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_image(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, t("dlg_open_image"), "", t("flt_img_arw"))
-        if not path:
+        if path:
+            self._load_image_paths([path])
+
+    def _load_image_paths(self, paths):
+        """a dropped (or picked) photo becomes the preview image; only image files are considered"""
+        paths = [p for p in paths if p.lower().endswith(IMAGE_EXTS)]
+        if not paths:
+            self._status(t("drop_bad"))
             return
+        path = paths[0]
         try:
-            from PIL import Image
-            im = Image.open(path).convert("RGB")
-            im.thumbnail((1600, 1600))
-            self.src_image = np.asarray(im, float) / 255.0
+            self.src_image = ST.load_rgb(path, 1600)
         except Exception as e:                       # noqa: BLE001
             self._fail(t("open_fail_title"), str(e))
             return
+        self.src_path = path
         self.view_src.set_image(self.src_image)
         self.view_state.reset()
         self._render_preview()
+        self._refresh_meta()
 
     # ================================================================ fit
     def _fit(self):
@@ -617,6 +809,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ================================================================ preview
     def _set_target_label(self, text):
         self.lbl_target_name.setText(text)
+        self.btn_view_ws.setVisible(self.target_kind == "portfolio" and bool(self.portfolio_paths))
 
     def _preview_image(self):
         """what the result plate shows: the photo on the bench whenever there is one — under the exact
@@ -661,6 +854,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.view_split.set_images(self.src_image, out)
         self._update_out_label()
         self._show_residual()
+        self._refresh_hist()
 
     def _render_recipe_preview(self):
         if self.recipe is None:
@@ -672,6 +866,39 @@ class MainWindow(QtWidgets.QMainWindow):
             self.view_split.set_images(self.src_image, out)
             self._update_out_label()
         self._show_residual()
+        self._refresh_hist()
+
+    # ---------------------------------------------------------------- histogram
+    def _on_hist_mode(self, _mode):
+        self._refresh_hist()
+
+    def _refresh_hist(self):
+        """feed the plot: the original photo, or the graded result, whichever the switch asks for"""
+        after = self.hist.after_mode
+        if after and self.result_image is not None:
+            rgb = self.result_image
+        else:
+            rgb = self.src_image
+        self.hist.set_rgb(rgb)
+
+    def _refresh_meta(self):
+        """the preview photo's ISO / shutter / aperture / focal, straight from its EXIF"""
+        if not self.src_path:
+            self.hist.set_meta(t("meta_none"))
+            return
+        info = ST.exif_summary(self.src_path)
+        vals = [info["iso"], info["shutter"], info["aperture"], info["focal"]]
+        if not any(vals):
+            self.hist.set_meta(t("meta_none"))
+            return
+        keys = ("meta_iso", "meta_shutter", "meta_aperture", "meta_focal")
+        self.hist.set_meta(" · ".join(t(k, v if v else "—") for k, v in zip(keys, vals)))
+
+    def _apply_clip(self, *_):
+        shadow = self.hist.btn_shadow.isChecked()
+        high = self.hist.btn_high.isChecked()
+        for v in (self.view_src, self.view_out, self.view_split):
+            v.set_clip_flags(shadow, high)
 
     def _show_residual(self):
         if self.target_lab is None or self.recipe is None or self.model is None:

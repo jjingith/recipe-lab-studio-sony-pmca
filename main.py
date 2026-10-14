@@ -33,8 +33,9 @@ def _taskbar_identity():
 
 def main():
     from PySide6 import QtCore, QtGui, QtWidgets
-    from ui.i18n import init_language
+    from ui.i18n import init_language, load_config
     from ui.main_window import MainWindow
+    from ui.theme import set_theme
 
     _taskbar_identity()
     app = QtWidgets.QApplication(sys.argv)
@@ -47,6 +48,8 @@ def main():
     # the UI language: the saved choice, else the system's own (uses QLocale.system(), which the
     # setDefault above does not affect)
     init_language()
+    # the saved theme (the light/dark switch in the menu bar writes it); dark is the default
+    set_theme(load_config().get("theme", "dark"))
     win = MainWindow()
     win.show()
     return app.exec()
